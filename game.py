@@ -9,7 +9,10 @@ MOVE_SPEED = 24.0
 FPS = 60.0
 DT = 1.0 / FPS
 MAX_SUBSTEP = 0.15
-LEVELS_DIR = "levels"
+
+# Folder Configuration
+LEVELS_DIR = "levels"           # For custom levels
+CAMPAIGN_DIR = "campaignlevels" # For main story levels
 SCORES_FILE = "scores.json"
 
 # Visuals
@@ -206,7 +209,6 @@ def play_level(stdscr, level_file, inp, timer_offset=0.0):
         # --- PAUSE MENU (Safe Quit) ---
         if inp.was_pressed('QUIT'):
             inp.clear()
-            # Clear buffer immediately to stop 'Q' repeating
             curses.flushinp()
 
             while True:
@@ -214,7 +216,6 @@ def play_level(stdscr, level_file, inp, timer_offset=0.0):
                 inp.update(stdscr)
 
                 if inp.was_pressed('QUIT'):
-                    # CRITICAL FIX: Flush inputs before exiting
                     curses.flushinp()
                     return "QUIT", 0.0
 
@@ -321,15 +322,17 @@ def main_wrapper(stdscr):
             if mode == "SINGLE":
                 path = specific_file
                 if not os.path.exists(path):
+                    # Check in custom levels folder
                     if os.path.exists(os.path.join(LEVELS_DIR, path)):
                         path = os.path.join(LEVELS_DIR, path)
             else:
-                path = os.path.join(LEVELS_DIR, f"level{current_lvl}.txt")
+                # Use CAMPAIGN_DIR for story mode
+                path = os.path.join(CAMPAIGN_DIR, f"level{current_lvl}.txt")
 
             res, elapsed = play_level(stdscr, path, inp, total_campaign_time)
 
             if res == "QUIT":
-                curses.flushinp() # Double check flush
+                curses.flushinp()
                 return "MENU"
 
             if res == "NO_FILE":
@@ -349,7 +352,7 @@ def main_wrapper(stdscr):
                 stdscr.addstr(curses.LINES//2 - 1, (curses.COLS - len(msg))//2, msg, curses.A_BOLD)
                 stdscr.addstr(curses.LINES//2 + 1, (curses.COLS - 20)//2, "Press ENTER to continue")
                 stdscr.refresh()
-                curses.flushinp() # Clear inputs before waiting for Enter
+                curses.flushinp()
 
                 while True:
                     inp.update(stdscr)
@@ -370,8 +373,9 @@ def main_wrapper(stdscr):
         inp.stop()
 
 if __name__ == "__main__":
-    ensure_levels = os.path.exists(LEVELS_DIR)
-    if not ensure_levels: os.makedirs(LEVELS_DIR, exist_ok=True)
+    # Ensure both folders exist
+    if not os.path.exists(LEVELS_DIR): os.makedirs(LEVELS_DIR, exist_ok=True)
+    if not os.path.exists(CAMPAIGN_DIR): os.makedirs(CAMPAIGN_DIR, exist_ok=True)
 
     res = curses.wrapper(main_wrapper)
 
@@ -379,6 +383,5 @@ if __name__ == "__main__":
         game_dir = os.path.dirname(os.path.abspath(__file__))
         menu_path = os.path.join(game_dir, "menu.py")
         if os.path.exists(menu_path):
-            # Safe sleep to ensure key buffers are physically released by OS
             time.sleep(0.1)
             os.execl(sys.executable, sys.executable, menu_path)

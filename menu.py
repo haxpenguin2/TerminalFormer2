@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 import curses, os, sys, json, subprocess, random, time
 
+# --- CONFIGURATION ---
 LEVELS_DIR = "levels"
+CAMPAIGN_DIR = "campaignlevels"
 SCORES_FILE = "scores.json"
 
-# --- CONFIGURATION ---
 BG_SCROLL_SPEED_X = 1
 BG_SCROLL_SPEED_Y = 0
 
-def ensure_levels_dir():
+def ensure_dirs():
     if not os.path.exists(LEVELS_DIR):
         os.makedirs(LEVELS_DIR)
+    if not os.path.exists(CAMPAIGN_DIR):
+        os.makedirs(CAMPAIGN_DIR)
 
-def get_levels():
-    ensure_levels_dir()
+def get_custom_levels():
+    ensure_dirs()
     return sorted([f for f in os.listdir(LEVELS_DIR) if f.endswith(".txt")])
 
 def load_scores():
@@ -25,9 +28,8 @@ def load_scores():
         except: pass
     return data
 
-def load_level_grid(filename):
-    """Loads a specific level grid for preview."""
-    path = os.path.join(LEVELS_DIR, filename)
+def load_level_grid(path):
+    """Loads a specific level grid for preview from a full path."""
     if not os.path.exists(path): return None
     try:
         with open(path, 'r') as f:
@@ -38,14 +40,26 @@ def load_level_grid(filename):
     except: return None
 
 def load_random_level_grid():
-    """Loads a random level for the background."""
-    levels = get_levels()
-    if levels:
-        chosen = random.choice(levels)
+    """Loads a random level for the background from ANY folder."""
+    ensure_dirs()
+    candidates = []
+
+    # Check Custom Levels
+    if os.path.exists(LEVELS_DIR):
+        for f in os.listdir(LEVELS_DIR):
+            if f.endswith(".txt"): candidates.append(os.path.join(LEVELS_DIR, f))
+
+    # Check Campaign Levels
+    if os.path.exists(CAMPAIGN_DIR):
+        for f in os.listdir(CAMPAIGN_DIR):
+            if f.endswith(".txt"): candidates.append(os.path.join(CAMPAIGN_DIR, f))
+
+    if candidates:
+        chosen = random.choice(candidates)
         grid = load_level_grid(chosen)
         if grid: return grid
 
-    # Fallback grid
+    # Fallback grid if no levels exist anywhere
     return [
         "########################################",
         "#                                      #",
@@ -170,7 +184,7 @@ def show_scoreboard(stdscr, bg_grid, cam_x, cam_y):
     row += 2
 
     # Levels
-    stdscr.addstr(row, col, "LEVEL BESTS:", curses.A_BOLD); row += 1
+    stdscr.addstr(row, col, "CUSTOM LEVEL BESTS:", curses.A_BOLD); row += 1
     all_keys = sorted([k for k in scores.keys() if k != "campaign"])
 
     for lvl in all_keys:
@@ -244,6 +258,8 @@ def play_game(path=None):
     try:
         curses.endwin()
         args = [sys.executable, "game.py"]
+        # If path is None, game.py defaults to Campaign Mode
+        # If path is provided, game.py defaults to Single Level Mode
         if path: args.append(path)
         subprocess.run(args)
     except: pass
@@ -257,36 +273,40 @@ def open_editor_subprocess(path):
 # --- SPECIFIC MENU LOGIC ---
 
 def menu_level_selector(stdscr, default_bg):
-    levels = get_levels()
-    if not levels: return
+    levels = get_custom_levels()
+    if not levels:
+        # Optional: Show alert if no levels
+        return
 
     items = []
     for lvl in levels:
         full_path = os.path.join(LEVELS_DIR, lvl)
         # Load grid for preview
-        grid = load_level_grid(lvl)
+        grid = load_level_grid(full_path)
         # (Label, Action, PreviewGrid)
         items.append( (lvl, lambda p=full_path: play_game(p), grid) )
 
     items.append( ("BACK", lambda: "BACK", None) )
-    run_menu_loop(stdscr, default_bg, "SELECT LEVEL", items)
+    run_menu_loop(stdscr, default_bg, "SELECT CUSTOM LEVEL", items)
 
 def menu_editor(stdscr, default_bg):
     while True:
-        levels = get_levels()
+        levels = get_custom_levels()
         items = []
 
         def do_new():
             name = get_string_input(stdscr, "New Level Name:")
             if name:
                 if not name.endswith(".txt"): name += ".txt"
+                # Editor saves to LEVELS_DIR by default
                 open_editor_subprocess(name)
             return "RELOAD"
 
         items.append( ("CREATE NEW LEVEL", do_new, None) )
 
         for lvl in levels:
-            grid = load_level_grid(lvl)
+            full_path = os.path.join(LEVELS_DIR, lvl)
+            grid = load_level_grid(full_path)
             items.append( (f"EDIT: {lvl}", lambda l=lvl: open_editor_subprocess(l), grid) )
 
         items.append( ("BACK", lambda: "BACK", None) )
@@ -298,6 +318,7 @@ def menu_editor(stdscr, default_bg):
 
 def main(stdscr):
     curses.curs_set(0)
+    ensure_dirs()
 
     # Setup Background
     bg_grid = load_random_level_grid()
@@ -305,7 +326,7 @@ def main(stdscr):
 
     main_options = [
         ("PLAY CAMPAIGN", lambda: play_game(), None),
-        ("SELECT LEVEL",  lambda: menu_level_selector(stdscr, bg_grid), None),
+        ("CUSTOM LEVELS", lambda: menu_level_selector(stdscr, bg_grid), None),
         ("LEVEL EDITOR",  lambda: menu_editor(stdscr, bg_grid), None),
         ("HIGH SCORES",   lambda: show_scoreboard(stdscr, bg_grid, cam_x, cam_y), None),
         ("QUIT GAME",     sys.exit, None)
@@ -319,8 +340,7 @@ def main(stdscr):
         cam_x += BG_SCROLL_SPEED_X
         cam_y += BG_SCROLL_SPEED_Y
 
-        # Determine BG (Main menu usually just keeps the random one,
-        # unless we wanted to preview level 1 on "Play Campaign")
+        # Determine BG
         active_bg = bg_grid
         if len(main_options[idx]) > 2 and main_options[idx][2]:
             active_bg = main_options[idx][2]
@@ -345,6 +365,9 @@ def main(stdscr):
             curses.curs_set(0)
             stdscr.nodelay(True)
             stdscr.timeout(30)
+
+            # Refresh BG in case they edited/played a level
+            bg_grid = load_random_level_grid()
 
         elif key in (ord('q'), ord('Q')):
             sys.exit(0)
