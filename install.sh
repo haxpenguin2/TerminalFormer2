@@ -16,6 +16,7 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
+PURPLE='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
@@ -23,10 +24,7 @@ NC='\033[0m'
 
 print_banner() {
     clear
-    # We print the color codes first
     echo -e "${CYAN}${BOLD}"
-    
-    # We use quoted EOF to prevent the shell from eating backslashes
     cat << "EOF"
   _______                   _             _   ______                              ___  
  |__   __|                 (_)           | | |  ____|                            |__ \ 
@@ -35,7 +33,6 @@ print_banner() {
     | |  __/ |  | | | | | || | | | | (_| | | | | | (_) | |  | | | | | |  __/ |    / /_ 
     |_|\___|_|  |_| |_| |_||_|_| |_|\__,_|_| |_|  \___/|_|  |_| |_| |_|\___|_|   |____|
 EOF
-    
     echo -e "${NC}"
     echo -e "${BLUE}  :: High-Performance Terminal Platformer Installer ::${NC}"
     echo -e "${BLUE}  :: v3.2 | Menu Launch | debug-mode enabled        ::${NC}"
@@ -44,20 +41,31 @@ EOF
 
 # $1 = percentage (0-100), $2 = Status text
 draw_bar() {
-    local width=40
+    local width=30
     local percent=$1
     local text=$2
     
-    # Calculate how many # and how many .
+    # Calculate fill width
     local num_filled=$(( (percent * width) / 100 ))
     local num_empty=$(( width - num_filled ))
     
-    # Construct the bar
-    local bar_filled=$(printf "%0.s#" $(seq 1 $num_filled))
-    local bar_empty=$(printf "%0.s." $(seq 1 $num_empty))
+    # Build the bar using Unicode block characters
+    # █ = U+2588 (Full Block)
+    # ░ = U+2591 (Light Shade)
     
-    # Print using \r to overwrite the line
-    echo -ne "\r${BOLD}[${GREEN}${bar_filled}${NC}${bar_empty}${BOLD}] ${percent}% - ${text}${NC}\033[K"
+    local bar_filled=""
+    if [ "$num_filled" -gt 0 ]; then
+        bar_filled=$(printf '█%.0s' $(seq 1 $num_filled))
+    fi
+    
+    local bar_empty=""
+    if [ "$num_empty" -gt 0 ]; then
+        bar_empty=$(printf '░%.0s' $(seq 1 $num_empty))
+    fi
+    
+    # Construct the line
+    # Format: [████░░░░] 50% Step Name
+    echo -ne "\r${BOLD}${CYAN}[${GREEN}${bar_filled}${NC}${BOLD}${bar_empty}${CYAN}]${NC} ${percent}% ${PURPLE}::${NC} ${text}\033[K"
 }
 
 # --- MAIN SCRIPT ---
@@ -65,31 +73,31 @@ draw_bar() {
 print_banner
 
 # 0. PRE-FLIGHT CHECK
-# Refresh sudo credentials upfront so the password prompt doesn't break the loading bar
 echo -e "${YELLOW}:: Requesting administrative access for installation...${NC}"
 sudo -v
-# Keep sudo alive in background
+# Keep sudo alive in background so it doesn't timeout during long installs
 ( while true; do sudo -v; sleep 60; done; ) &
 SUDO_PID=$!
 
-# Hide Cursor
+# Hide Cursor for a cleaner look
 tput civis
 
 # 1. CHECK DEPENDENCIES
 draw_bar 10 "Checking System Libraries..."
 if [ -x "$(command -v apt-get)" ]; then
+    # Silence output so the bar stays clean
     sudo apt-get update > /dev/null 2>&1
-    # We silence the output so it doesn't break the bar
     sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm > /dev/null 2>&1
 fi
 
 # 2. FIX INPUT PERMISSIONS
 draw_bar 30 "Verifying Input Permissions..."
+# Sleep purely for visual effect so the user sees this step happened
+sleep 0.5 
 if ! groups "$USER" | grep &>/dev/null "\binput\b"; then
     if sudo usermod -a -G input "$USER" > /dev/null 2>&1; then
         PERMISSIONS_CHANGED=true
     else
-        # If this fails, we can't really stop, but we note it
         PERMISSIONS_CHANGED=false
     fi
 fi
@@ -107,7 +115,7 @@ fi
 draw_bar 60 "Downloading TerminalFormer2..."
 git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1
 if [ ! -d "$INSTALL_DIR" ]; then
-    tput cnorm
+    tput cnorm # Restore cursor if we crash
     echo ""
     echo -e "${RED}ERROR: Git clone failed. Check internet connection.${NC}"
     kill $SUDO_PID
@@ -124,7 +132,7 @@ rm -rf "$BACKUP_DIR"
 draw_bar 90 "Creating Shortcuts..."
 LAUNCHER_PATH="/usr/local/bin/$BIN_NAME"
 
-# Create the wrapper script (silently)
+# Create wrapper script
 cat <<EOF > tf2_launcher.tmp
 #!/bin/bash
 cd "$INSTALL_DIR"
@@ -146,7 +154,7 @@ EOF
 chmod +x tf2_launcher.tmp
 sudo mv tf2_launcher.tmp "$LAUNCHER_PATH" > /dev/null 2>&1
 
-# Create .desktop file (silently)
+# Create .desktop file
 mkdir -p "$HOME/.local/share/applications"
 cat <<EOF > "$DESKTOP_FILE"
 [Desktop Entry]
@@ -166,10 +174,10 @@ update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
 # 7. FINALIZE
 draw_bar 100 "Finalizing..."
 sudo chown -R "$USER:$USER" "$INSTALL_DIR" > /dev/null 2>&1
+sleep 0.5
 
-# Clean up background sudo
+# Kill background sudo and restore cursor
 kill $SUDO_PID
-# Restore cursor
 tput cnorm
 
 echo ""
