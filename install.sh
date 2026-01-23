@@ -4,7 +4,8 @@
 REPO_URL="https://github.com/haxpenguin2/TerminalFormer2.git"
 INSTALL_DIR="$HOME/.terminal_former2"
 BACKUP_DIR="/tmp/tf2_backup_$(date +%s)"
-USER_GROUP="input"
+BIN_NAME="terminalformer2"
+DESKTOP_FILE="$HOME/.local/share/applications/terminalformer2.desktop"
 
 # --- COLORS & STYLES ---
 RED='\033[0;31m'
@@ -27,7 +28,7 @@ print_banner() {
     echo "    |_|\___|_|  |_| |_| |_|_|_| |_|\__,_|_| |_|  \___/|_|  |_| |_| |_|\___|_|      "
     echo -e "${NC}"
     echo -e "${BLUE}  :: High-Performance Terminal Platformer Installer ::${NC}"
-    echo -e "${BLUE}  :: v2.5 | Auto-Updater | Permission Fixer         ::${NC}"
+    echo -e "${BLUE}  :: v3.0 | Desktop App | Auto-Updater | Perms Fix  ::${NC}"
     echo ""
 }
 
@@ -36,30 +37,16 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
-}
-
 # --- MAIN SCRIPT ---
 print_banner
 
-# 1. CHECK SYSTEM DEPENDENCIES
-echo -e "${BOLD}Step 1: Checking System Dependencies...${NC}"
+# 1. CHECK SYSTEM DEPENDENCIES (VISIBLE LOGS)
+echo -e "${BOLD}Step 1: Checking System Libraries...${NC}"
 if [ -x "$(command -v apt-get)" ]; then
     log_info "Debian/Ubuntu detected. Installing requirements..."
-    sudo apt-get update -qq > /dev/null 2>&1
-    sudo apt-get install -y python3-evdev git python3 python3-pip -qq > /dev/null 2>&1 &
-    spinner $!
+    # We allow the output to be seen now
+    sudo apt-get update
+    sudo apt-get install -y python3-evdev git python3 python3-pip curl gnome-terminal
     log_success "Dependencies installed."
 else
     log_warn "Not on Debian/Ubuntu. Assuming dependencies (python3-evdev, git) are installed manually."
@@ -91,23 +78,20 @@ echo -e "${BOLD}Step 3: Preparing Installation Directory...${NC}"
 
 if [ -d "$INSTALL_DIR" ]; then
     log_info "Existing installation found at $INSTALL_DIR"
-    log_info "Backing up custom levels and scores..."
+    log_info "Backing up custom levels and scores to $BACKUP_DIR..."
     
     mkdir -p "$BACKUP_DIR"
     
     # Backup Scores
     if [ -f "$INSTALL_DIR/scores.json" ]; then
         cp "$INSTALL_DIR/scores.json" "$BACKUP_DIR/"
-        log_info "Backed up scores.json"
     fi
 
-    # Backup Levels (Entire folder to be safe)
+    # Backup Levels
     if [ -d "$INSTALL_DIR/levels" ]; then
         cp -r "$INSTALL_DIR/levels" "$BACKUP_DIR/"
-        log_info "Backed up custom levels"
     fi
     
-    # Remove old installation
     log_info "Removing old program files..."
     rm -rf "$INSTALL_DIR"
 else
@@ -116,10 +100,9 @@ fi
 
 echo ""
 
-# 4. CLONE REPOSITORY
+# 4. CLONE REPOSITORY (VISIBLE LOGS)
 echo -e "${BOLD}Step 4: Downloading TerminalFormer2...${NC}"
-git clone "$REPO_URL" "$INSTALL_DIR" -q &
-spinner $!
+git clone "$REPO_URL" "$INSTALL_DIR"
 
 if [ -d "$INSTALL_DIR" ]; then
     log_success "Download complete."
@@ -139,40 +122,79 @@ if [ -f "$BACKUP_DIR/scores.json" ]; then
     log_success "Restored scores."
 fi
 
-# Restore Levels (Merge strategy: Don't overwrite default files if they are newer, but ensure user files exist)
-# Actually, safest for custom levels is to copy them back.
+# Restore Levels
 if [ -d "$BACKUP_DIR/levels" ]; then
     mkdir -p "$INSTALL_DIR/levels"
     cp -rn "$BACKUP_DIR/levels/"* "$INSTALL_DIR/levels/" > /dev/null 2>&1
     log_success "Restored custom levels."
 fi
-
-# Cleanup backup folder
 rm -rf "$BACKUP_DIR"
 
 echo ""
 
-# 6. FINALIZE
-echo -e "${BOLD}Step 6: Finalizing...${NC}"
-# Make sure permissions inside the folder are correct for the user
-sudo chown -R "$USER:$USER" "$INSTALL_DIR"
+# 6. CREATE LAUNCHERS & DESKTOP ENTRIES
+echo -e "${BOLD}Step 6: Creating Application Shortcuts...${NC}"
 
-# Create a handy alias instruction
-echo "alias tf2='python3 $INSTALL_DIR/game.py'" >> ~/.bash_aliases 2>/dev/null
+# A. Create a global launcher script in /usr/local/bin
+LAUNCHER_PATH="/usr/local/bin/$BIN_NAME"
+log_info "Creating global command '$BIN_NAME'..."
+
+# Create a temporary launcher file locally first
+cat <<EOF > tf2_launcher.tmp
+#!/bin/bash
+cd "$INSTALL_DIR"
+python3 game.py "\$@"
+EOF
+
+chmod +x tf2_launcher.tmp
+sudo mv tf2_launcher.tmp "$LAUNCHER_PATH"
+log_success "Global command installed. You can now type '$BIN_NAME' anywhere!"
+
+# B. Create .desktop file
+log_info "Creating Desktop Entry..."
+mkdir -p "$HOME/.local/share/applications"
+
+cat <<EOF > "$DESKTOP_FILE"
+[Desktop Entry]
+Version=1.0
+Name=TerminalFormer 2
+Comment=High-performance terminal platformer
+Exec=gnome-terminal -- /usr/local/bin/$BIN_NAME
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Game;
+Keywords=platformer;terminal;game;
+EOF
+
+# Note: We use "Terminal=false" but "Exec=gnome-terminal" to force a
+# FRESH terminal window for the game, ensuring inputs work correctly.
+
+# Update desktop database
+update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
+log_success "Desktop shortcut created!"
+
+echo ""
+
+# 7. FINALIZE
+echo -e "${BOLD}Step 7: Finalizing...${NC}"
+sudo chown -R "$USER:$USER" "$INSTALL_DIR"
 
 echo ""
 echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo -e "${GREEN}${BOLD}       INSTALLATION COMPLETE!             ${NC}"
 echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo ""
-echo -e "To play the game, run:"
-echo -e "  ${CYAN}python3 $INSTALL_DIR/game.py${NC}"
+echo -e "You can play the game in three ways:"
+echo -e "  1. Type ${CYAN}$BIN_NAME${NC} in any terminal."
+echo -e "  2. Search for ${CYAN}TerminalFormer 2${NC} in your Apps menu."
+echo -e "  3. Run ${CYAN}python3 $INSTALL_DIR/game.py${NC}"
 echo ""
 
 if [ "$PERMISSIONS_CHANGED" = true ]; then
-    echo -e "${RED}${BOLD}!!! IMPORTANT !!!${NC}"
-    echo -e "${YELLOW}We changed your user permissions to allow keyboard access.${NC}"
-    echo -e "${YELLOW}${BOLD}YOU MUST LOG OUT AND LOG BACK IN (OR REBOOT) FOR THIS TO WORK.${NC}"
-    echo -e "${YELLOW}If you don't, the game will crash saying 'Permission Denied'.${NC}"
+    echo -e "${RED}${BOLD}!!! IMPORTANT REBOOT REQUIRED !!!${NC}"
+    echo -e "${YELLOW}We enabled hardware input permissions for your user.${NC}"
+    echo -e "${YELLOW}${BOLD}PLEASE REBOOT YOUR COMPUTER NOW.${NC}"
+    echo -e "${YELLOW}If you don't, the game will crash with 'Permission Denied'.${NC}"
     echo ""
 fi
