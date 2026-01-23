@@ -1,4 +1,4 @@
-\#!/bin/bash
+#!/bin/bash
 
 # --- CONFIGURATION ---
 REPO_URL="https://github.com/haxpenguin2/TerminalFormer2.git"
@@ -19,13 +19,19 @@ NC='\033[0m'
 # --- HELPER FUNCTIONS ---
 print_banner() {
     clear
+    # We print the color codes first
     echo -e "${CYAN}${BOLD}"
-    echo "  _______                   _             _ ______                                  ___  "
-    echo " |__   __|                 (_)           | |  ____|                                |__ \ "
-    echo "    | | ___ _ __ _ __ ___   _ _ __   __ _| | |__ ___  _ __ _ __ ___   ___ _ __        ) |"
-    echo "    | |/ _ \ '__| '_ \` _ \ | | '_ \ / _\` | |  __/ _ \| '__| '_ \` _ \ / _ \ '__|      / / "
-    echo "    | |  __/ |  | | | | | | | | | | (_| | | | | (_) | |  | | | | | |  __/ |        / /_ "
-    echo "    |_|\___|_|  |_| |_| |_| |_|_| |_|\__,_|_|_|  \___/|_|  |_| |_| |_|\___|_|       |____|"
+    
+    # We use quoted EOF to prevent the shell from eating backslashes
+    cat << "EOF"
+  _______                   _             _   ______                                   ___  
+ |__   __|                 (_)           | | |  ____|                                 |__ \ 
+    | | ___ _ __ _ __ ___   _ _ __   __ _| | | |__ ___  _ __ _ __ ___   ___ _ __         ) |
+    | |/ _ \ '__| '_ ` _ \ | | '_ \ / _` | | |  __/ _ \| '__| '_ ` _ \ / _ \ '__|       / / 
+    | |  __/ |  | | | | | | | | | | (_| | | | | | (_) | |  | | | | | |  __/ |         / /_ 
+    |_|\___|_|  |_| |_| |_| |_|_| |_|\__,_|_| |_|  \___/|_|  |_| |_| |_|\___|_|        |____|
+EOF
+    
     echo -e "${NC}"
     echo -e "${BLUE}  :: High-Performance Terminal Platformer Installer ::${NC}"
     echo -e "${BLUE}  :: v3.2 | Menu Launch | debug-mode enabled        ::${NC}"
