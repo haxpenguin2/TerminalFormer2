@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import curses, time, os, math, sys, threading, json
+import curses, time, os, math, sys, json
 from collections import deque
 
 # --- CONFIGURATION ---
@@ -48,76 +48,76 @@ def save_score(category, new_time):
     with open(SCORES_FILE, 'w') as f:
         json.dump(data, f)
 
-# --- INPUT ENGINE ---
+# --- INPUT ENGINE (STRICT EVDEV MODE) ---
 try:
-    import evdev
-    HAS_EVDEV = True
+    import evdev_input
+    HAS_EVDEV_WRAPPER = True
 except ImportError:
-    HAS_EVDEV = False
+    HAS_EVDEV_WRAPPER = False
 
 class InputEngine:
     def __init__(self):
         self.keys = {k: False for k in ['LEFT', 'RIGHT', 'UP', 'DOWN', 'JUMP', 'RESET', 'QUIT', 'CONTINUE']}
         self.pressed = set()
-        self.running = True
-        self.using_evdev = False
-        self.dev = None
+        self.ev_handler = None
+        
+        # 1. CRITICAL CHECK: Is the wrapper file missing?
+        if not HAS_EVDEV_WRAPPER:
+            curses.endwin()
+            print("\n" + "="*50)
+            print("[ERROR] MISSING DEPENDENCY")
+            print("The file 'evdev_input.py' is missing from this folder.")
+            print("Please run the installer again or download the file.")
+            print("="*50 + "\n")
+            sys.exit(1)
 
-        if HAS_EVDEV:
-            try:
-                devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-                for dev in devices:
-                    if "keyboard" in dev.name.lower():
-                        self.dev = dev
-                        self.using_evdev = True
-                        threading.Thread(target=self._run, daemon=True).start()
-                        break
-            except: pass
+        # 2. CRITICAL CHECK: Do we have permission to read the keyboard?
+        try:
+            self.ev_handler = evdev_input.EvdevInput()
+            
+            # If no devices were found, it usually means Permission Denied (or no keyboard plugged in)
+            if not self.ev_handler.devices:
+                curses.endwin()
+                print("\n" + "="*50)
+                print("[ERROR] INPUT PERMISSION DENIED")
+                print("The game cannot read your keyboard directly.")
+                print("\nTO FIX THIS, RUN:")
+                print(f"  sudo usermod -a -G input {os.environ.get('USER', 'your_username')}")
+                print("\nThen LOG OUT and LOG BACK IN.")
+                print("="*50 + "\n")
+                sys.exit(1)
 
-    def _run(self):
-        for event in self.dev.read_loop():
-            if not self.running: break
-            if event.type == evdev.ecodes.EV_KEY:
-                down = (event.value == 1 or event.value == 2)
-                code = event.code
-                k = None
-                if code in [105, 30]: k = 'LEFT'
-                elif code in [106, 32]: k = 'RIGHT'
-                elif code in [103, 17, 57]: k = 'JUMP'
-                elif code in [19]: k = 'RESET'
-                elif code in [16]: k = 'QUIT'
-                elif code in [28]: k = 'CONTINUE'
-
-                if k:
-                    if down and not self.keys[k]: self.pressed.add(k)
-                    self.keys[k] = down
+        except Exception as e:
+            curses.endwin()
+            print(f"\n[ERROR] Input System Failed: {e}")
+            sys.exit(1)
 
     def update(self, stdscr):
-        if self.using_evdev: return
-        stdscr.nodelay(True)
+        # STRICT MODE: ONLY READ FROM EVDEV
+        if self.ev_handler:
+            events = self.ev_handler.poll(timeout=0.0)
+            for token, value in events:
+                k = None
+                if token == 'LEFT': k = 'LEFT'
+                elif token == 'RIGHT': k = 'RIGHT'
+                elif token in ['UP', 'SPACE']: k = 'JUMP'
+                elif token == 'R': k = 'RESET'
+                elif token == 'Q': k = 'QUIT'
+                elif token in ['CONTINUE', 'SPACE']: k = 'CONTINUE'
 
-        ch = stdscr.getch()
-        while ch != -1:
-            k = None
-            if ch in (curses.KEY_LEFT, ord('a')): k = 'LEFT'
-            elif ch in (curses.KEY_RIGHT, ord('d')): k = 'RIGHT'
-            elif ch in (curses.KEY_UP, ord('w'), ord(' ')): k = 'JUMP'
-            elif ch in (ord('r'), ord('R')): k = 'RESET'
-            elif ch in (ord('q'), ord('Q')): k = 'QUIT'
-            elif ch == 10: k = 'CONTINUE'
-
-            if k:
-                self.keys[k] = True
-                self.pressed.add(k)
-            ch = stdscr.getch()
-
-        for k in self.keys:
-            if self.keys[k]: self.keys[k] = False
+                if k:
+                    # value: 1=down, 0=up, 2=hold
+                    is_down = (value == 1 or value == 2)
+                    if is_down and not self.keys[k]:
+                        self.pressed.add(k)
+                    self.keys[k] = is_down
 
     def was_pressed(self, k): return k in self.pressed
     def is_down(self, k): return self.keys[k]
     def clear(self): self.pressed.clear()
-    def stop(self): self.running = False
+    def stop(self):
+        if self.ev_handler:
+            self.ev_handler.close()
 
 # --- PHYSICS ---
 def load_level(path):
@@ -214,11 +214,9 @@ def play_level(stdscr, level_file, inp, timer_offset=0.0):
             while True:
                 draw_scene(stdscr, grid, px, py, int(cam_x), int(cam_y), 0, "PAUSED (Q:QUIT / SPACE:RESUME)", timer_offset + current_level_time)
                 inp.update(stdscr)
-
                 if inp.was_pressed('QUIT'):
                     curses.flushinp()
                     return "QUIT", 0.0
-
                 if inp.was_pressed('JUMP') or inp.was_pressed('CONTINUE'):
                     last_time = time.time()
                     break
@@ -322,11 +320,9 @@ def main_wrapper(stdscr):
             if mode == "SINGLE":
                 path = specific_file
                 if not os.path.exists(path):
-                    # Check in custom levels folder
                     if os.path.exists(os.path.join(LEVELS_DIR, path)):
                         path = os.path.join(LEVELS_DIR, path)
             else:
-                # Use CAMPAIGN_DIR for story mode
                 path = os.path.join(CAMPAIGN_DIR, f"level{current_lvl}.txt")
 
             res, elapsed = play_level(stdscr, path, inp, total_campaign_time)
@@ -373,7 +369,6 @@ def main_wrapper(stdscr):
         inp.stop()
 
 if __name__ == "__main__":
-    # Ensure both folders exist
     if not os.path.exists(LEVELS_DIR): os.makedirs(LEVELS_DIR, exist_ok=True)
     if not os.path.exists(CAMPAIGN_DIR): os.makedirs(CAMPAIGN_DIR, exist_ok=True)
 
