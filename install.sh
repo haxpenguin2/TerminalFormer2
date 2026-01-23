@@ -65,7 +65,7 @@ draw_bar() {
     
     # Construct the line
     # Format: [████░░░░] 50% Step Name
-    echo -ne "\r${BOLD}${CYAN}[${GREEN}${bar_filled}${NC}${BOLD}${bar_empty}${CYAN}]${NC} ${percent}% ${PURPLE}::${NC} ${text}\033[K"
+    echo -ne "\r${BOLD}${CYAN}[${CYAN}${bar_filled}${NC}${BOLD}${bar_empty}${CYAN}]${NC} ${percent}% ${PURPLE}::${NC} ${text}\033[K"
 }
 
 # --- MAIN SCRIPT ---
