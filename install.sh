@@ -1,3 +1,6 @@
+
+
+
 #!/bin/bash
 
 # --- CONFIGURATION ---
@@ -17,6 +20,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # --- HELPER FUNCTIONS ---
+
 print_banner() {
     clear
     # We print the color codes first
@@ -28,7 +32,7 @@ print_banner() {
  |__   __|                 (_)           | | |  ____|                            |__ \ 
     | | ___ _ __ _ __ ___   _ _ __   __ _| | | |__ ___  _ __ _ __ ___   ___ _ __    ) |
     | |/ _ \ '__| '_ ` _ \ | | '_ \ / _` | | |  __/ _ \| '__| '_ ` _ \ / _ \ '__|  / / 
-    | |  __/ |  | | | | | || | | | (_| | | | | | | (_) | |  | | | | | |  __/ |    / /_ 
+    | |  __/ |  | | | | | || | | | | (_| | | | | | (_) | |  | | | | | |  __/ |    / /_ 
     |_|\___|_|  |_| |_| |_||_|_| |_|\__,_|_| |_|  \___/|_|  |_| |_| |_|\___|_|   |____|
 EOF
     
@@ -38,109 +42,112 @@ EOF
     echo ""
 }
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# $1 = percentage (0-100), $2 = Status text
+draw_bar() {
+    local width=40
+    local percent=$1
+    local text=$2
+    
+    # Calculate how many # and how many .
+    local num_filled=$(( (percent * width) / 100 ))
+    local num_empty=$(( width - num_filled ))
+    
+    # Construct the bar
+    local bar_filled=$(printf "%0.s#" $(seq 1 $num_filled))
+    local bar_empty=$(printf "%0.s." $(seq 1 $num_empty))
+    
+    # Print using \r to overwrite the line
+    echo -ne "\r${BOLD}[${GREEN}${bar_filled}${NC}${bar_empty}${BOLD}] ${percent}% - ${text}${NC}\033[K"
+}
 
 # --- MAIN SCRIPT ---
+
 print_banner
 
+# 0. PRE-FLIGHT CHECK
+# Refresh sudo credentials upfront so the password prompt doesn't break the loading bar
+echo -e "${YELLOW}:: Requesting administrative access for installation...${NC}"
+sudo -v
+# Keep sudo alive in background
+( while true; do sudo -v; sleep 60; done; ) &
+SUDO_PID=$!
+
+# Hide Cursor
+tput civis
+
 # 1. CHECK DEPENDENCIES
-echo -e "${BOLD}Step 1: Checking System Libraries...${NC}"
+draw_bar 10 "Checking System Libraries..."
 if [ -x "$(command -v apt-get)" ]; then
-    log_info "Debian/Ubuntu detected."
-    sudo apt-get update
-    sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm
-    log_success "Dependencies installed."
-else
-    log_warn "Not on Debian/Ubuntu. Assuming dependencies are installed."
+    sudo apt-get update > /dev/null 2>&1
+    # We silence the output so it doesn't break the bar
+    sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm > /dev/null 2>&1
 fi
-echo ""
 
 # 2. FIX INPUT PERMISSIONS
-echo -e "${BOLD}Step 2: Verifying Input Permissions...${NC}"
-if groups "$USER" | grep &>/dev/null "\binput\b"; then
-    log_success "User '$USER' is already in the 'input' group."
-else
-    log_warn "User '$USER' is NOT in the 'input' group."
-    log_info "Attempting to fix permissions..."
-    if sudo usermod -a -G input "$USER"; then
-        log_success "Permission fix applied!"
+draw_bar 30 "Verifying Input Permissions..."
+if ! groups "$USER" | grep &>/dev/null "\binput\b"; then
+    if sudo usermod -a -G input "$USER" > /dev/null 2>&1; then
         PERMISSIONS_CHANGED=true
     else
-        log_error "Failed to fix permissions. Run: sudo usermod -a -G input $USER"
-        exit 1
+        # If this fails, we can't really stop, but we note it
+        PERMISSIONS_CHANGED=false
     fi
 fi
-echo ""
 
 # 3. BACKUP
-echo -e "${BOLD}Step 3: Preparing Installation Directory...${NC}"
+draw_bar 45 "Backing up old data..."
 if [ -d "$INSTALL_DIR" ]; then
-    log_info "Backing up data to $BACKUP_DIR..."
     mkdir -p "$BACKUP_DIR"
     [ -f "$INSTALL_DIR/scores.json" ] && cp "$INSTALL_DIR/scores.json" "$BACKUP_DIR/"
     [ -d "$INSTALL_DIR/levels" ] && cp -r "$INSTALL_DIR/levels" "$BACKUP_DIR/"
     rm -rf "$INSTALL_DIR"
 fi
-echo ""
 
 # 4. DOWNLOAD
-echo -e "${BOLD}Step 4: Downloading TerminalFormer2...${NC}"
-git clone "$REPO_URL" "$INSTALL_DIR"
+draw_bar 60 "Downloading TerminalFormer2..."
+git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1
 if [ ! -d "$INSTALL_DIR" ]; then
-    log_error "Git clone failed."
+    tput cnorm
+    echo ""
+    echo -e "${RED}ERROR: Git clone failed. Check internet connection.${NC}"
+    kill $SUDO_PID
     exit 1
 fi
-echo ""
 
 # 5. RESTORE
-echo -e "${BOLD}Step 5: Restoring User Data...${NC}"
+draw_bar 75 "Restoring User Data..."
 [ -f "$BACKUP_DIR/scores.json" ] && mv "$BACKUP_DIR/scores.json" "$INSTALL_DIR/"
 [ -d "$BACKUP_DIR/levels" ] && mkdir -p "$INSTALL_DIR/levels" && cp -rn "$BACKUP_DIR/levels/"* "$INSTALL_DIR/levels/" 2>/dev/null
 rm -rf "$BACKUP_DIR"
-log_success "Data restored."
-echo ""
 
-# 6. CREATE LAUNCHERS (The Important Part)
-echo -e "${BOLD}Step 6: Creating Application Shortcuts...${NC}"
-
+# 6. CREATE LAUNCHERS
+draw_bar 90 "Creating Shortcuts..."
 LAUNCHER_PATH="/usr/local/bin/$BIN_NAME"
-log_info "Creating global command '$BIN_NAME'..."
 
-# We create a robust wrapper that NEVER closes immediately
+# Create the wrapper script (silently)
 cat <<EOF > tf2_launcher.tmp
 #!/bin/bash
 cd "$INSTALL_DIR"
-
-# Logic: Try to run menu.py first. If missing, run game.py
 TARGET="game.py"
 if [ -f "menu.py" ]; then
     TARGET="menu.py"
 fi
-
 echo "Launching \$TARGET..."
 python3 "\$TARGET" "\$@"
 EXIT_CODE=\$?
-
 echo ""
 echo "=================================================="
 echo " Application Exited (Code: \$EXIT_CODE)"
 echo "=================================================="
-echo "If you see an error above, please fix it."
 echo "Press ENTER to close this window..."
 read
 EOF
 
 chmod +x tf2_launcher.tmp
-sudo mv tf2_launcher.tmp "$LAUNCHER_PATH"
-log_success "Global command updated."
+sudo mv tf2_launcher.tmp "$LAUNCHER_PATH" > /dev/null 2>&1
 
-# Create .desktop file
-log_info "Creating Desktop Entry..."
+# Create .desktop file (silently)
 mkdir -p "$HOME/.local/share/applications"
-
 cat <<EOF > "$DESKTOP_FILE"
 [Desktop Entry]
 Version=1.0
@@ -155,22 +162,23 @@ Keywords=platformer;terminal;game;
 EOF
 
 update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
-log_success "Desktop shortcut fixed!"
-
-echo ""
 
 # 7. FINALIZE
-echo -e "${BOLD}Step 7: Finalizing...${NC}"
-sudo chown -R "$USER:$USER" "$INSTALL_DIR"
+draw_bar 100 "Finalizing..."
+sudo chown -R "$USER:$USER" "$INSTALL_DIR" > /dev/null 2>&1
 
+# Clean up background sudo
+kill $SUDO_PID
+# Restore cursor
+tput cnorm
+
+echo ""
 echo ""
 echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo -e "${GREEN}${BOLD}       INSTALLATION COMPLETE!             ${NC}"
 echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo ""
-echo -e "Try opening the app now."
-echo -e "It will launch into the MENU (if menu.py exists)."
-echo -e "If it crashes, the window will WAIT so you can read the error."
+echo -e "Type 'terminalformer2' to play."
 echo ""
 
 if [ "$PERMISSIONS_CHANGED" = true ]; then
