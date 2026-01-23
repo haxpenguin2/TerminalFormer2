@@ -28,7 +28,7 @@ print_banner() {
     echo "    |_|\___|_|  |_| |_| |_|_|_| |_|\__,_|_| |_|  \___/|_|  |_| |_| |_|\___|_|      "
     echo -e "${NC}"
     echo -e "${BLUE}  :: High-Performance Terminal Platformer Installer ::${NC}"
-    echo -e "${BLUE}  :: v3.1 | Desktop Fix | Error Logging             ::${NC}"
+    echo -e "${BLUE}  :: v3.2 | Menu Launch | debug-mode enabled        ::${NC}"
     echo ""
 }
 
@@ -45,7 +45,6 @@ echo -e "${BOLD}Step 1: Checking System Libraries...${NC}"
 if [ -x "$(command -v apt-get)" ]; then
     log_info "Debian/Ubuntu detected."
     sudo apt-get update
-    # We install xterm as a fallback just in case
     sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm
     log_success "Dependencies installed."
 else
@@ -98,38 +97,41 @@ rm -rf "$BACKUP_DIR"
 log_success "Data restored."
 echo ""
 
-# 6. CREATE ROBUST LAUNCHERS
+# 6. CREATE LAUNCHERS (The Important Part)
 echo -e "${BOLD}Step 6: Creating Application Shortcuts...${NC}"
 
-# A. Create Global Launcher with PAUSE on crash
 LAUNCHER_PATH="/usr/local/bin/$BIN_NAME"
 log_info "Creating global command '$BIN_NAME'..."
 
+# We create a robust wrapper that NEVER closes immediately
 cat <<EOF > tf2_launcher.tmp
 #!/bin/bash
-# Move to the game directory
 cd "$INSTALL_DIR"
 
-# Run the game
-python3 game.py "\$@"
+# Logic: Try to run menu.py first. If missing, run game.py
+TARGET="game.py"
+if [ -f "menu.py" ]; then
+    TARGET="menu.py"
+fi
+
+echo "Launching \$TARGET..."
+python3 "\$TARGET" "\$@"
 EXIT_CODE=\$?
 
-# If the game crashes (exit code not 0) or acts weird, keep window open
-if [ \$EXIT_CODE -ne 0 ]; then
-    echo ""
-    echo "-----------------------------------------------------"
-    echo "GAME CRASHED WITH EXIT CODE: \$EXIT_CODE"
-    echo "-----------------------------------------------------"
-    echo "Press ENTER to close this window..."
-    read
-fi
+echo ""
+echo "=================================================="
+echo " Application Exited (Code: \$EXIT_CODE)"
+echo "=================================================="
+echo "If you see an error above, please fix it."
+echo "Press ENTER to close this window..."
+read
 EOF
 
 chmod +x tf2_launcher.tmp
 sudo mv tf2_launcher.tmp "$LAUNCHER_PATH"
 log_success "Global command updated."
 
-# B. Create .desktop file
+# Create .desktop file
 log_info "Creating Desktop Entry..."
 mkdir -p "$HOME/.local/share/applications"
 
@@ -146,7 +148,6 @@ Categories=Game;
 Keywords=platformer;terminal;game;
 EOF
 
-# Update desktop database
 update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
 log_success "Desktop shortcut fixed!"
 
@@ -161,8 +162,9 @@ echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo -e "${GREEN}${BOLD}       INSTALLATION COMPLETE!             ${NC}"
 echo -e "${GREEN}${BOLD}==========================================${NC}"
 echo ""
-echo -e "Try opening the app from your menu now."
-echo -e "If it crashes, the window will stay open to tell you why!"
+echo -e "Try opening the app now."
+echo -e "It will launch into the MENU (if menu.py exists)."
+echo -e "If it crashes, the window will WAIT so you can read the error."
 echo ""
 
 if [ "$PERMISSIONS_CHANGED" = true ]; then
