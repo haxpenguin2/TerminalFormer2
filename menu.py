@@ -9,7 +9,7 @@ SCORES_FILE = "scores.json"
 BG_SCROLL_SPEED_X = 1
 BG_SCROLL_SPEED_Y = 0
 
-# --- MOVING PLATFORM LOGIC ---
+# --- MOVING PLATFORM LOGIC (For Menu BG) ---
 class MovingPlatform:
     def __init__(self, data):
         self.x_origin = data['x']
@@ -38,8 +38,8 @@ class MovingPlatform:
 
 # --- FILE OPERATIONS ---
 def ensure_dirs():
-    if not os.path.exists(LEVELS_DIR): os.makedirs(LEVELS_DIR)
-    if not os.path.exists(CAMPAIGN_DIR): os.makedirs(CAMPAIGN_DIR)
+    if not os.path.exists(LEVELS_DIR): os.makedirs(LEVELS_DIR, exist_ok=True)
+    if not os.path.exists(CAMPAIGN_DIR): os.makedirs(CAMPAIGN_DIR, exist_ok=True)
 
 def get_custom_levels():
     ensure_dirs()
@@ -81,14 +81,12 @@ def load_level_data(path):
                     plat_data = meta
                 elif isinstance(meta, dict):
                     plat_data = meta.get('platforms', [])
-                    # Extract title and clean quotes
                     if "title" in meta:
                         title = str(meta["title"]).replace('"', '')
 
                 for p in plat_data:
                     new_plat = MovingPlatform(p)
                     platforms.append(new_plat)
-                    # Clear grid under platform
                     for i in range(new_plat.w):
                         gx, gy = int(new_plat.x_origin) + i, int(new_plat.y_origin)
                         if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]):
@@ -116,7 +114,6 @@ def load_random_level_data():
         chosen = random.choice(candidates)
         return load_level_data(chosen)
 
-    # Fallback
     return ([
         "########################################",
         "#                                      #",
@@ -148,10 +145,9 @@ def get_string_input(stdscr, prompt):
 # --- UNIFIED DRAWING ENGINE ---
 def draw_background(stdscr, level_data, cam_x, cam_y):
     if not level_data: return
-    # Unpack safely (handle potential 2-tuple or 3-tuple)
     grid = level_data[0]
     platforms = level_data[1]
-    
+
     if not grid: return
 
     h, w = stdscr.getmaxyx()
@@ -180,7 +176,7 @@ def draw_background(stdscr, level_data, cam_x, cam_y):
         try: stdscr.addstr(y, 0, line_buffer)
         except: pass
 
-    # 2. Draw Moving Platforms (Robust Tiling)
+    # 2. Draw Moving Platforms
     base_offset_x = -int(cam_x % grid_w)
     base_offset_y = -int(cam_y % grid_h)
 
@@ -296,15 +292,12 @@ def run_menu_loop(stdscr, default_bg_data, title, items):
 
         # --- UPDATE ALL PHYSICS ---
         if default_bg_data:
-             # default_bg_data is (grid, platforms, title)
              for p in default_bg_data[1]: p.update(0.05)
 
         for item in items:
             if len(item) > 2 and item[2]:
-                # item[2] is (grid, platforms, title)
                 platforms = item[2][1]
-                for p in platforms:
-                    p.update(0.05)
+                for p in platforms: p.update(0.05)
 
         labels = [item[0] for item in items]
         draw_menu_frame(stdscr, active_data, cam_x, cam_y, title, labels, idx)
@@ -316,15 +309,19 @@ def run_menu_loop(stdscr, default_bg_data, title, items):
             idx = (idx - 1) % len(items)
         elif key == curses.KEY_DOWN:
             idx = (idx + 1) % len(items)
-        elif key in (10, 13):
+        elif key in (10, 13, 32): # Added Spacebar (32)
             action = items[idx][1]
             result = action()
+
+            # --- THE FIX FOR RESPONSIVENESS ---
+            curses.flushinp()
+            stdscr.clear()
+            stdscr.refresh()
+            stdscr.timeout(30)
+
             if result == "BACK": return
             if result == "RELOAD": return "RELOAD"
-            stdscr.clear()
-            curses.curs_set(0)
-            stdscr.nodelay(True)
-            stdscr.timeout(30)
+
         elif key in (ord('q'), ord('Q')):
             return
 
@@ -351,10 +348,9 @@ def menu_level_selector(stdscr, default_bg_data):
     for lvl in levels:
         full_path = os.path.join(LEVELS_DIR, lvl)
         lvl_data = load_level_data(full_path)
-        # Display: Title (filename.txt)
         lvl_title = lvl_data[2]
         display_name = f"{lvl_title} ({lvl})"
-        
+
         items.append( (display_name, lambda p=full_path: play_game(p), lvl_data) )
 
     items.append( ("BACK", lambda: "BACK", None) )
@@ -377,11 +373,8 @@ def menu_editor(stdscr, default_bg_data):
         for lvl in levels:
             full_path = os.path.join(LEVELS_DIR, lvl)
             lvl_data = load_level_data(full_path)
-            # Display: EDIT: Title (filename.txt)
             lvl_title = lvl_data[2]
             display_name = f"EDIT: {lvl_title} ({lvl})"
-            
-            # Now passing lvl_data to the 3rd tuple element allows background preview!
             items.append( (display_name, lambda l=lvl: open_editor_subprocess(l), lvl_data) )
 
         items.append( ("BACK", lambda: "BACK", None) )
@@ -418,8 +411,7 @@ def main(stdscr):
             active_data = main_options[idx][2]
 
         if bg_data:
-            # bg_data[1] is platforms list
-            for p in bg_data[1]: p.update(0.05)
+             for p in bg_data[1]: p.update(0.05)
 
         labels = [opt[0] for opt in main_options]
         draw_menu_frame(stdscr, active_data, cam_x, cam_y, "TerminalFormer2", labels, idx)
@@ -431,13 +423,14 @@ def main(stdscr):
             idx = (idx - 1) % len(main_options)
         elif key == curses.KEY_DOWN:
             idx = (idx + 1) % len(main_options)
-        elif key in (10, 13):
+        elif key in (10, 13, 32):
             func = main_options[idx][1]
             func()
 
+            # --- THE FIX FOR RESPONSIVENESS ---
+            curses.flushinp()
             stdscr.clear()
-            curses.curs_set(0)
-            stdscr.nodelay(True)
+            stdscr.refresh()
             stdscr.timeout(30)
 
             bg_data = load_random_level_data()
@@ -446,4 +439,7 @@ def main(stdscr):
             sys.exit(0)
 
 if __name__ == "__main__":
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

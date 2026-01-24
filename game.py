@@ -61,23 +61,16 @@ class InputEngine:
         self.pressed = set()
         self.ev_handler = None
 
-        if not HAS_EVDEV_WRAPPER:
-            curses.endwin()
-            print("[ERROR] MISSING evdev_input.py")
-            sys.exit(1)
-
         try:
-            self.ev_handler = evdev_input.EvdevInput()
-            if not self.ev_handler.devices:
-                curses.endwin()
-                print("[ERROR] INPUT PERMISSION DENIED (Run with sudo?)")
-                sys.exit(1)
+            if HAS_EVDEV_WRAPPER:
+                self.ev_handler = evdev_input.EvdevInput()
         except Exception as e:
-            curses.endwin()
-            sys.exit(1)
+            pass
 
     def update(self, stdscr):
-        if self.ev_handler:
+        # 1. Controller Update (Evdev)
+        # We only rely on state persistence here because evdev sends explicit up/down events.
+        if self.ev_handler and self.ev_handler.devices:
             events = self.ev_handler.poll(timeout=0.0)
             for token, value in events:
                 k = None
@@ -96,9 +89,43 @@ class InputEngine:
                     elif value == 0:
                         self.keys[k] = False
 
+        # 2. Keyboard Update (Fallback / Hybrid)
+        # FIX: Reset keys if we are relying on keyboard to prevent "stuck" keys.
+        # Since curses getch() doesn't send "key up" events, we must assume
+        # keys are up unless pressed this frame.
+        if not self.ev_handler or not self.ev_handler.devices:
+            for k in self.keys:
+                self.keys[k] = False
+
+        try:
+            # Drain the input buffer
+            while True:
+                k = stdscr.getch()
+                if k == -1: break
+
+                key_name = None
+                if k == curses.KEY_LEFT: key_name = 'LEFT'
+                elif k == curses.KEY_RIGHT: key_name = 'RIGHT'
+                elif k == ord(' '): key_name = 'JUMP' # Also CONTINUE
+                elif k in (ord('r'), ord('R')): key_name = 'RESET'
+                elif k in (ord('q'), ord('Q')): key_name = 'QUIT'
+
+                if key_name:
+                    self.keys[key_name] = True
+                    self.pressed.add(key_name)
+                    if key_name == 'JUMP':
+                        self.keys['CONTINUE'] = True
+                        self.pressed.add('CONTINUE')
+        except: pass
+
     def was_pressed(self, k): return k in self.pressed
     def is_down(self, k): return self.keys[k]
-    def clear(self): self.pressed.clear()
+    def clear(self):
+        self.pressed.clear()
+        # Ensure keyboard keys don't linger if input stops
+        if not HAS_EVDEV_WRAPPER or (self.ev_handler and not self.ev_handler.devices):
+            pass # We reset at start of update() now, so this is safer.
+
     def stop(self):
         if self.ev_handler: self.ev_handler.close()
 
@@ -151,7 +178,6 @@ def load_level(path):
     grid = [list(l.ljust(w, ' ')) for l in lines]
 
     platforms = []
-    # Default title is the filename without extension
     level_title = os.path.splitext(os.path.basename(path))[0]
 
     if len(parts) > 1:
@@ -160,10 +186,8 @@ def load_level(path):
             plat_data = []
 
             if isinstance(data, dict):
-                # Get title and strip any existing quotes to avoid double quoting later
                 raw_title = data.get("title", level_title)
                 level_title = str(raw_title).replace('"', '')
-
                 plat_data = data.get("platforms", [])
             elif isinstance(data, list):
                 plat_data = data
@@ -223,13 +247,18 @@ def draw_scene(stdscr, grid, platforms, px, py, cam_x, cam_y, fps, msg, elapsed_
     start_y = target_y if grid_h >= h else 0
 
     # Draw Map
-    for scr_y in range(h - 1):
+    # FIX: Loop range(h) instead of range(h-1) to allow seeing the ground
+    for scr_y in range(h):
         map_y = scr_y - offset_y + start_y
         if 0 <= map_y < grid_h:
             row_str = "".join(grid[map_y])
             if grid_w >= w:
                 slice_end = min(start_x + w, len(row_str))
-                stdscr.addstr(scr_y, 0, row_str[start_x : slice_end])
+                line_to_draw = row_str[start_x : slice_end]
+                # Safe draw to avoid bottom-right corner scroll error
+                try:
+                    stdscr.addstr(scr_y, 0, line_to_draw)
+                except curses.error: pass
             else:
                 try: stdscr.addstr(scr_y, offset_x, row_str)
                 except: pass
@@ -238,7 +267,7 @@ def draw_scene(stdscr, grid, platforms, px, py, cam_x, cam_y, fps, msg, elapsed_
     for p in platforms:
         scr_px = int(p.x - start_x) + offset_x
         scr_py = int(p.y - start_y) + offset_y
-        if 0 <= scr_py < h-1:
+        if 0 <= scr_py < h: # FIX: Allow drawing on bottom row
             draw_len = p.w
             if scr_px < 0:
                 draw_len += scr_px
@@ -252,26 +281,24 @@ def draw_scene(stdscr, grid, platforms, px, py, cam_x, cam_y, fps, msg, elapsed_
     # Draw Player
     scr_px = int(px - start_x) + offset_x
     scr_py = int(py - start_y) + offset_y
-    if visible and 0 <= scr_px < w and 0 <= scr_py < h-1:
-        stdscr.addch(scr_py, scr_px, PLAYER_CHAR, curses.A_BOLD)
+    if visible and 0 <= scr_px < w and 0 <= scr_py < h: # FIX: Allow drawing on bottom row
+        try:
+            stdscr.addch(scr_py, scr_px, PLAYER_CHAR, curses.A_BOLD)
+        except: pass
 
     # UI
-    # LEVEL NAME DISPLAY (Top Left)
-    # Format: LEVEL 1 "Introduction"
     if not msg:
         title_str = f"LEVEL {lvl_num} \"{lvl_title}\""
         try: stdscr.addstr(0, 0, title_str, curses.A_BOLD)
         except: pass
 
-    # Message Overlay
     if msg: stdscr.addstr(0, 1, msg, curses.A_REVERSE | curses.A_BOLD)
 
-    # Timer (Top Right)
     timer_str = f"TIME: {elapsed_time:.2f}s"
     try: stdscr.addstr(0, w - len(timer_str) - 2, timer_str, curses.A_BOLD)
     except: pass
 
-    # Debug info (Bottom Left)
+    # Debug info (moved up slightly to avoid collision with new bottom row logic)
     try: stdscr.addstr(h-1, 0, f"Pos: {int(px)},{int(py)} | FPS: {int(fps)}")
     except: pass
 
@@ -301,6 +328,8 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
     active_platform = None
     platform_offset_x = 0.0
 
+    stdscr.nodelay(True)
+
     while True:
         inp.update(stdscr)
 
@@ -325,7 +354,6 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
 
         current_level_time = (now - start_time)
 
-        # 1. Update Platforms
         for p in platforms: p.update(dt)
 
         if inp.was_pressed('RESET'):
@@ -343,7 +371,6 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                 px = active_platform.x + platform_offset_x
                 active_platform = None
             else:
-                # 1. Move Offset (Input)
                 local_vx = input_dir * MOVE_SPEED
                 remaining_dt = dt
                 current_offset = platform_offset_x
@@ -351,7 +378,6 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                 while remaining_dt > 0:
                     step = min(remaining_dt, MAX_SUBSTEP)
                     remaining_dt -= step
-
                     next_offset = current_offset + local_vx * step
                     world_x_next = active_platform.x + next_offset
                     world_y_fixed = active_platform.y - HALF_H - PLATFORM_TOP_TOLERANCE
@@ -362,24 +388,21 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                         current_offset = next_offset
 
                 platform_offset_x = current_offset
-
-                # 2. Sync Physics Position
                 px = active_platform.x + platform_offset_x
                 py = active_platform.y - HALF_H - PLATFORM_TOP_TOLERANCE
                 vy = 0
 
-                # 3. Bounds Check
                 if px < active_platform.x - 0.1 or px > active_platform.x + active_platform.w + 0.1:
                     active_platform = None
 
-                # 4. Ceiling Crush
+                # Check Ceiling (Attached)
                 if check_rect_grid(grid, px - HALF_W + 0.1, py - HALF_H + 0.1, px + HALF_W - 0.1, py + HALF_H - 0.1):
+                    # Crushed
                     pass
 
         else:
             # === DETACHED MODE ===
             is_grounded_grid = check_rect_grid(grid, px - HALF_W, py + HALF_H, px + HALF_W, py + HALF_H + 0.05)
-
             if inp.was_pressed('JUMP') and is_grounded_grid:
                  vy = JUMP_V
             else:
@@ -397,10 +420,8 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                     vx = 0
                 else:
                     p_hit = check_platform_collision(platforms, next_px - HALF_W, py - HALF_H + 0.1, next_px + HALF_W, py + HALF_H - 0.1)
-                    if p_hit:
-                        vx = 0
-                    else:
-                        px = next_px
+                    if p_hit: vx = 0
+                    else: px = next_px
 
             remaining_dt = dt
             while remaining_dt > 0:
@@ -408,7 +429,6 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                 remaining_dt -= step
                 next_py = py + vy * step
 
-                # 1. Grid Collision
                 if check_rect_grid(grid, px - HALF_W, next_py - HALF_H, px + HALF_W, next_py + HALF_H):
                     if vy > 0:
                         py = math.floor(next_py + HALF_H) - HALF_H - 0.001
@@ -416,29 +436,24 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
                         py = math.floor(next_py - HALF_H) + HALF_H + 1.001
                     vy = 0
                 else:
-                    # 2. Platform Collision
                     hit_platform = False
-
-                    if vy >= 0: # Moving DOWN (Landing)
+                    if vy >= 0:
                         p_hit = check_platform_collision(platforms, px - HALF_W, next_py - HALF_H, px + HALF_W, next_py + HALF_H)
                         if p_hit:
-                            # Only land if we were previously ABOVE the platform centerline
                             if (py + HALF_H) <= (p_hit.y + 1.5):
                                 active_platform = p_hit
                                 platform_offset_x = px - active_platform.x
                                 py = active_platform.y - HALF_H - PLATFORM_TOP_TOLERANCE
                                 vy = 0
                                 hit_platform = True
-
-                    elif vy < 0: # Moving UP (Ceiling Bonk)
+                    elif vy < 0:
                         p_hit = check_platform_collision(platforms, px - HALF_W, next_py - HALF_H, px + HALF_W, next_py + HALF_H)
                         if p_hit:
                             py = p_hit.y + 1.0 + HALF_H + 0.001
                             vy = 0
                             hit_platform = True
 
-                    if not hit_platform:
-                        py = next_py
+                    if not hit_platform: py = next_py
 
         # --- DEATH CHECK ---
         cx, cy = int(px), int(py)
@@ -472,14 +487,12 @@ def play_level(stdscr, level_file, inp, level_num, timer_offset=0.0):
         fps_hist.append(fps)
         if time.time() > msg_end: msg = None
 
-        # --- VISUAL CORRECTION (THE LAG FIX) ---
+        # Visual Fix
         render_px, render_py = px, py
         if active_platform:
-            # Force render Y to be exactly one tile above the Platform's render Y
             render_py = float(int(active_platform.y)) - 0.5
 
         inp.clear()
-
         draw_scene(stdscr, grid, platforms, render_px, render_py, int(cam_x), int(cam_y), sum(fps_hist)/len(fps_hist), msg, timer_offset + current_level_time, level_num, level_title)
         time.sleep(0.005)
 
@@ -501,54 +514,62 @@ def main_wrapper(stdscr):
 
     try:
         while True:
-            try:
-                if mode == "SINGLE":
-                    path = specific_file
-                    if not os.path.exists(path):
-                        if os.path.exists(os.path.join(LEVELS_DIR, path)):
-                            path = os.path.join(LEVELS_DIR, path)
-                else:
-                    path = os.path.join(CAMPAIGN_DIR, f"level{current_lvl}.txt")
+            # 1. RESOLVE PATH AND CHECK EXISTENCE
+            path = ""
+            if mode == "SINGLE":
+                path = specific_file
+                if not os.path.exists(path) and os.path.exists(os.path.join(LEVELS_DIR, path)):
+                    path = os.path.join(LEVELS_DIR, path)
+            else:
+                path = os.path.join(CAMPAIGN_DIR, f"level{current_lvl}.txt")
 
-                res, elapsed = play_level(stdscr, path, inp, current_lvl, total_campaign_time)
-
-                if res == "QUIT":
-                    return "MENU"
-
-                if res == "NO_FILE":
-                    if mode == "CAMPAIGN" and current_lvl > 1:
+            if not os.path.exists(path):
+                if mode == "CAMPAIGN":
+                    if current_lvl > 1:
                         save_score("campaign", total_campaign_time)
                         stdscr.clear()
-                        msg = f"CAMPAIGN FINISHED! TIME: {total_campaign_time:.2f}s"
+                        msg = f"CAMPAIGN FINISHED! TOTAL TIME: {total_campaign_time:.2f}s"
                         stdscr.addstr(curses.LINES//2, (curses.COLS - len(msg))//2, msg, curses.A_BOLD)
                         stdscr.refresh()
                         time.sleep(3)
-                    return "MENU"
-
-                if res == "NEXT_LEVEL":
-                    stdscr.clear()
-                    msg = f"LEVEL COMPLETE! TIME: {elapsed:.2f}s"
-                    stdscr.addstr(curses.LINES//2 - 1, (curses.COLS - len(msg))//2, msg, curses.A_BOLD)
-                    stdscr.refresh()
-                    curses.flushinp()
-                    time.sleep(0.5)
-                    while True:
-                        inp.update(stdscr)
-                        if inp.was_pressed('CONTINUE') or inp.was_pressed('JUMP'):
-                            inp.clear(); break
-                        time.sleep(0.05)
-
-                    if mode == "SINGLE":
-                        fname = os.path.basename(specific_file)
-                        save_score(fname, elapsed)
-                        return "MENU"
                     else:
-                        total_campaign_time += elapsed
-                        current_lvl += 1
-
-            except KeyboardInterrupt:
+                        stdscr.clear()
+                        stdscr.addstr(0,0, f"Error: Could not find {path}")
+                        stdscr.refresh()
+                        time.sleep(2)
                 return "MENU"
 
+            # 3. PLAY
+            res, elapsed = play_level(stdscr, path, inp, current_lvl, total_campaign_time)
+
+            if res == "QUIT":
+                return "MENU"
+
+            if res == "NEXT_LEVEL":
+                stdscr.clear()
+                msg = f"LEVEL COMPLETE! TIME: {elapsed:.2f}s"
+                stdscr.addstr(curses.LINES//2 - 1, (curses.COLS - len(msg))//2, msg, curses.A_BOLD)
+                stdscr.refresh()
+                curses.flushinp()
+                time.sleep(0.5)
+
+                while True:
+                    inp.update(stdscr)
+                    if inp.was_pressed('CONTINUE') or inp.was_pressed('JUMP'):
+                        inp.clear()
+                        break
+                    time.sleep(0.05)
+
+                if mode == "SINGLE":
+                    fname = os.path.basename(specific_file)
+                    save_score(fname, elapsed)
+                    return "MENU"
+                else:
+                    total_campaign_time += elapsed
+                    current_lvl += 1
+
+    except KeyboardInterrupt:
+        return "MENU"
     finally:
         inp.stop()
 
@@ -560,10 +581,3 @@ if __name__ == "__main__":
         res = curses.wrapper(main_wrapper)
     except KeyboardInterrupt:
         res = "MENU"
-
-    if res == "MENU":
-        game_dir = os.path.dirname(os.path.abspath(__file__))
-        menu_path = os.path.join(game_dir, "menu.py")
-        if os.path.exists(menu_path):
-            time.sleep(0.1)
-            os.execl(sys.executable, sys.executable, menu_path)
