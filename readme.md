@@ -1,5 +1,5 @@
 
-# TerminalFormer2
+# TerminalFormer2 (UPDATE 1.3 HERE!!!)
 
 TerminalFormer2 is a high-performance, physics-based platformer engine and level editor designed for the Linux terminal. It utilizes the curses library for graphics and evdev for low-latency hardware input handling.
 
