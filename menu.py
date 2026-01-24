@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import curses, os, sys, json, subprocess, random, time
+import curses, os, sys, json, subprocess, random, time, math
 
 # --- CONFIGURATION ---
 LEVELS_DIR = "levels"
@@ -9,11 +9,37 @@ SCORES_FILE = "scores.json"
 BG_SCROLL_SPEED_X = 1
 BG_SCROLL_SPEED_Y = 0
 
+# --- MOVING PLATFORM LOGIC ---
+class MovingPlatform:
+    def __init__(self, data):
+        self.x_origin = data['x']
+        self.y_origin = data['y']
+        self.w = data['w']
+        self.limit_x = data.get('lx', 0)
+        self.limit_y = data.get('ly', 0)
+        self.speed = data.get('spd', 1.0)
+        self.easing = data.get('ease', 'SINE')
+
+        self.x = self.x_origin
+        self.y = self.y_origin
+        self.timer = 0.0
+
+    def update(self, dt):
+        self.timer += dt * self.speed
+        offset = 0
+        if self.easing == 'SINE':
+            offset = math.sin(self.timer)
+        else:
+            t = (self.timer / math.pi) % 2
+            offset = (t - 1) if t > 1 else (1 - t)
+
+        self.x = self.x_origin + (offset * (self.limit_x / 2))
+        self.y = self.y_origin + (offset * (self.limit_y / 2))
+
+# --- FILE OPERATIONS ---
 def ensure_dirs():
-    if not os.path.exists(LEVELS_DIR):
-        os.makedirs(LEVELS_DIR)
-    if not os.path.exists(CAMPAIGN_DIR):
-        os.makedirs(CAMPAIGN_DIR)
+    if not os.path.exists(LEVELS_DIR): os.makedirs(LEVELS_DIR)
+    if not os.path.exists(CAMPAIGN_DIR): os.makedirs(CAMPAIGN_DIR)
 
 def get_custom_levels():
     ensure_dirs()
@@ -28,59 +54,84 @@ def load_scores():
         except: pass
     return data
 
-def load_level_grid(path):
-    """Loads a specific level grid for preview from a full path."""
-    if not os.path.exists(path): return None
+def load_level_data(path):
+    """Returns: (grid_list, platform_object_list)"""
+    if not os.path.exists(path): return None, []
+
     try:
         with open(path, 'r') as f:
-            lines = [l.rstrip("\n") for l in f.readlines()]
-        if not lines: return None
-        w = max(len(l) for l in lines)
-        return [l.ljust(w, ' ') for l in lines]
-    except: return None
+            content = f.read()
 
-def load_random_level_grid():
-    """Loads a random level for the background from ANY folder."""
+        parts = content.split("__METADATA__")
+        lines = [l.rstrip("\n") for l in parts[0].strip().split('\n')]
+
+        if not lines: return None, []
+
+        w = max(len(l) for l in lines)
+        grid = [list(l.ljust(w, ' ')) for l in lines]
+        platforms = []
+
+        if len(parts) > 1:
+            try:
+                # NEW: Handle List (Legacy) or Dict (New)
+                meta = json.loads(parts[1])
+                plat_data = []
+
+                if isinstance(meta, list):
+                    plat_data = meta
+                elif isinstance(meta, dict):
+                    plat_data = meta.get('platforms', [])
+
+                for p in plat_data:
+                    new_plat = MovingPlatform(p)
+                    platforms.append(new_plat)
+                    # Clear grid under platform
+                    for i in range(new_plat.w):
+                        gx, gy = int(new_plat.x_origin) + i, int(new_plat.y_origin)
+                        if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]):
+                            grid[gy][gx] = ' '
+            except: pass
+
+        grid_strs = ["".join(row) for row in grid]
+        return grid_strs, platforms
+
+    except: return None, []
+
+def load_random_level_data():
     ensure_dirs()
     candidates = []
 
-    # Check Custom Levels
     if os.path.exists(LEVELS_DIR):
         for f in os.listdir(LEVELS_DIR):
             if f.endswith(".txt"): candidates.append(os.path.join(LEVELS_DIR, f))
 
-    # Check Campaign Levels
     if os.path.exists(CAMPAIGN_DIR):
         for f in os.listdir(CAMPAIGN_DIR):
             if f.endswith(".txt"): candidates.append(os.path.join(CAMPAIGN_DIR, f))
 
     if candidates:
         chosen = random.choice(candidates)
-        grid = load_level_grid(chosen)
-        if grid: return grid
+        return load_level_data(chosen)
 
-    # Fallback grid if no levels exist anywhere
-    return [
+    # Fallback
+    return ([
         "########################################",
         "#                                      #",
         "#            TerminalFormer2           #",
         "#                                      #",
         "########################################"
-    ] * 5
+    ] * 5, [])
 
 # --- INPUT HELPER ---
 def get_string_input(stdscr, prompt):
-    """Blocking text input for new filenames."""
     curses.echo()
     curses.curs_set(1)
     stdscr.nodelay(False)
 
     stdscr.clear()
     h, w = stdscr.getmaxyx()
-
     msg = f" {prompt} "
     stdscr.addstr(h//2 - 2, (w-len(msg))//2, msg, curses.A_BOLD)
-
     stdscr.move(h//2, (w//2) - 10)
     stdscr.refresh()
 
@@ -92,21 +143,22 @@ def get_string_input(stdscr, prompt):
     return inp.strip()
 
 # --- UNIFIED DRAWING ENGINE ---
-def draw_background(stdscr, grid, cam_x, cam_y):
-    """Draws the level grid dimmed as a background."""
+def draw_background(stdscr, level_data, cam_x, cam_y):
+    if not level_data: return
+    grid, platforms = level_data
     if not grid: return
+
     h, w = stdscr.getmaxyx()
 
-    # PURE MONOCHROME: Use A_DIM to make it dark grey
     stdscr.attron(curses.A_DIM)
 
     grid_h = len(grid)
     grid_w = len(grid[0]) if grid_h > 0 else 0
 
+    # 1. Draw Static Grid
     for y in range(h):
         map_y = int(y + cam_y) % grid_h
         row_str = grid[map_y]
-
         start_x = int(cam_x) % grid_w
 
         drawn_len = 0
@@ -122,28 +174,52 @@ def draw_background(stdscr, grid, cam_x, cam_y):
         try: stdscr.addstr(y, 0, line_buffer)
         except: pass
 
+    # 2. Draw Moving Platforms (Robust Tiling)
+    base_offset_x = -int(cam_x % grid_w)
+    base_offset_y = -int(cam_y % grid_h)
+
+    for p in platforms:
+        curr_y = base_offset_y
+        while curr_y < h:
+            curr_x = base_offset_x
+            while curr_x < w:
+                scr_x = int(curr_x + p.x)
+                scr_y = int(curr_y + p.y)
+
+                if -p.w < scr_x < w and 0 <= scr_y < h:
+                    draw_str = '█' * p.w
+                    start_char = 0
+                    if scr_x < 0:
+                        start_char = -scr_x
+                        scr_x = 0
+
+                    final_len = len(draw_str) - start_char
+                    if scr_x + final_len >= w:
+                        final_len = w - scr_x
+
+                    if final_len > 0:
+                        try: stdscr.addstr(scr_y, scr_x, draw_str[start_char:start_char+final_len])
+                        except: pass
+                curr_x += grid_w
+            curr_y += grid_h
+
     stdscr.attroff(curses.A_DIM)
 
-def draw_menu_frame(stdscr, bg_grid, cam_x, cam_y, title, items, selected_idx):
+def draw_menu_frame(stdscr, level_data, cam_x, cam_y, title, items, selected_idx):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
-    # 1. Background
-    draw_background(stdscr, bg_grid, cam_x, cam_y)
+    draw_background(stdscr, level_data, cam_x, cam_y)
 
-    # 2. Calculate Layout
     menu_height = len(items) * 2
     start_y = (h - menu_height) // 2
 
-    # 3. Title
     stdscr.attron(curses.A_BOLD | curses.A_UNDERLINE)
     stdscr.addstr(start_y - 4, (w - len(title))//2, title)
     stdscr.attroff(curses.A_BOLD | curses.A_UNDERLINE)
 
-    # 4. Items
     for i, label in enumerate(items):
         y = start_y + (i * 2)
-
         if i == selected_idx:
             text = f">  {label}  <"
             stdscr.attron(curses.A_BOLD)
@@ -153,17 +229,15 @@ def draw_menu_frame(stdscr, bg_grid, cam_x, cam_y, title, items, selected_idx):
             text = f"   {label}   "
             stdscr.addstr(y, (w - len(text))//2, text)
 
-    # 5. Footer
     hint = "UP/DOWN: Navigate  |  ENTER: Select  |  Q: Back/Quit"
     stdscr.addstr(h - 2, (w - len(hint))//2, hint, curses.A_DIM)
-
     stdscr.refresh()
 
-def show_scoreboard(stdscr, bg_grid, cam_x, cam_y):
+def show_scoreboard(stdscr, bg_data, cam_x, cam_y):
     stdscr.nodelay(False)
     scores = load_scores()
     stdscr.erase()
-    draw_background(stdscr, bg_grid, cam_x, cam_y)
+    draw_background(stdscr, bg_data, cam_x, cam_y)
 
     h, w = stdscr.getmaxyx()
     title = "--- HIGH SCORES ---"
@@ -172,7 +246,6 @@ def show_scoreboard(stdscr, bg_grid, cam_x, cam_y):
     row = 6
     col = max(2, (w // 2) - 15)
 
-    # Campaign
     stdscr.addstr(row, col, "CAMPAIGN:", curses.A_BOLD); row += 1
     if "campaign" in scores:
         for i, t in enumerate(scores["campaign"]):
@@ -182,8 +255,6 @@ def show_scoreboard(stdscr, bg_grid, cam_x, cam_y):
         stdscr.addstr(row, col+2, "No runs yet."); row += 1
 
     row += 2
-
-    # Levels
     stdscr.addstr(row, col, "CUSTOM LEVEL BESTS:", curses.A_BOLD); row += 1
     all_keys = sorted([k for k in scores.keys() if k != "campaign"])
 
@@ -195,44 +266,42 @@ def show_scoreboard(stdscr, bg_grid, cam_x, cam_y):
 
     msg = "Press ANY KEY to return"
     stdscr.addstr(h-3, (w-len(msg))//2, msg, curses.A_BOLD)
-
     stdscr.refresh()
     stdscr.getch()
     stdscr.nodelay(True)
 
 # --- SUB MENUS ---
-
-def run_menu_loop(stdscr, default_bg, title, items):
-    """
-    Items Structure:
-    [ (Label, Action_Callback, Optional_Preview_Grid), ... ]
-    """
+def run_menu_loop(stdscr, default_bg_data, title, items):
     idx = 0
     cam_x, cam_y = 0.0, 0.0
-
     stdscr.nodelay(True)
     stdscr.timeout(30)
 
     while True:
-        # Animate BG
         cam_x += BG_SCROLL_SPEED_X
         cam_y += BG_SCROLL_SPEED_Y
 
-        # Determine which BG to show
-        # If the currently selected item has a specific grid (index 2), use it.
-        # Otherwise, use default_bg.
+        # Determine active level data
         current_item = items[idx]
-        active_bg = default_bg
+        active_data = default_bg_data
 
         if len(current_item) > 2 and current_item[2] is not None:
-            active_bg = current_item[2]
+            active_data = current_item[2]
 
-        # Extract labels
+        # --- UPDATE ALL PHYSICS ---
+        if default_bg_data:
+             for p in default_bg_data[1]: p.update(0.05)
+
+        for item in items:
+            if len(item) > 2 and item[2]:
+                _, platforms = item[2]
+                for p in platforms:
+                    p.update(0.05)
+
         labels = [item[0] for item in items]
-        draw_menu_frame(stdscr, active_bg, cam_x, cam_y, title, labels, idx)
+        draw_menu_frame(stdscr, active_data, cam_x, cam_y, title, labels, idx)
 
         key = stdscr.getch()
-
         if key == -1: continue
 
         if key == curses.KEY_UP:
@@ -244,13 +313,10 @@ def run_menu_loop(stdscr, default_bg, title, items):
             result = action()
             if result == "BACK": return
             if result == "RELOAD": return "RELOAD"
-
-            # Reset state
             stdscr.clear()
             curses.curs_set(0)
             stdscr.nodelay(True)
             stdscr.timeout(30)
-
         elif key in (ord('q'), ord('Q')):
             return
 
@@ -258,8 +324,6 @@ def play_game(path=None):
     try:
         curses.endwin()
         args = [sys.executable, "game.py"]
-        # If path is None, game.py defaults to Campaign Mode
-        # If path is provided, game.py defaults to Single Level Mode
         if path: args.append(path)
         subprocess.run(args)
     except: pass
@@ -271,25 +335,20 @@ def open_editor_subprocess(path):
     except: pass
 
 # --- SPECIFIC MENU LOGIC ---
-
-def menu_level_selector(stdscr, default_bg):
+def menu_level_selector(stdscr, default_bg_data):
     levels = get_custom_levels()
-    if not levels:
-        # Optional: Show alert if no levels
-        return
+    if not levels: return
 
     items = []
     for lvl in levels:
         full_path = os.path.join(LEVELS_DIR, lvl)
-        # Load grid for preview
-        grid = load_level_grid(full_path)
-        # (Label, Action, PreviewGrid)
-        items.append( (lvl, lambda p=full_path: play_game(p), grid) )
+        lvl_data = load_level_data(full_path)
+        items.append( (lvl, lambda p=full_path: play_game(p), lvl_data) )
 
     items.append( ("BACK", lambda: "BACK", None) )
-    run_menu_loop(stdscr, default_bg, "SELECT CUSTOM LEVEL", items)
+    run_menu_loop(stdscr, default_bg_data, "SELECT CUSTOM LEVEL", items)
 
-def menu_editor(stdscr, default_bg):
+def menu_editor(stdscr, default_bg_data):
     while True:
         levels = get_custom_levels()
         items = []
@@ -298,7 +357,6 @@ def menu_editor(stdscr, default_bg):
             name = get_string_input(stdscr, "New Level Name:")
             if name:
                 if not name.endswith(".txt"): name += ".txt"
-                # Editor saves to LEVELS_DIR by default
                 open_editor_subprocess(name)
             return "RELOAD"
 
@@ -306,29 +364,26 @@ def menu_editor(stdscr, default_bg):
 
         for lvl in levels:
             full_path = os.path.join(LEVELS_DIR, lvl)
-            grid = load_level_grid(full_path)
-            items.append( (f"EDIT: {lvl}", lambda l=lvl: open_editor_subprocess(l), grid) )
+            items.append( (f"EDIT: {lvl}", lambda l=lvl: open_editor_subprocess(l), None) )
 
         items.append( ("BACK", lambda: "BACK", None) )
 
-        res = run_menu_loop(stdscr, default_bg, "LEVEL EDITOR", items)
+        res = run_menu_loop(stdscr, default_bg_data, "LEVEL EDITOR", items)
         if res != "RELOAD": break
 
 # --- MAIN ENTRY ---
-
 def main(stdscr):
     curses.curs_set(0)
     ensure_dirs()
 
-    # Setup Background
-    bg_grid = load_random_level_grid()
+    bg_data = load_random_level_data()
     cam_x, cam_y = 0.0, 0.0
 
     main_options = [
         ("PLAY CAMPAIGN", lambda: play_game(), None),
-        ("CUSTOM LEVELS", lambda: menu_level_selector(stdscr, bg_grid), None),
-        ("LEVEL EDITOR",  lambda: menu_editor(stdscr, bg_grid), None),
-        ("HIGH SCORES",   lambda: show_scoreboard(stdscr, bg_grid, cam_x, cam_y), None),
+        ("CUSTOM LEVELS", lambda: menu_level_selector(stdscr, bg_data), None),
+        ("LEVEL EDITOR",  lambda: menu_editor(stdscr, bg_data), None),
+        ("HIGH SCORES",   lambda: show_scoreboard(stdscr, bg_data, cam_x, cam_y), None),
         ("QUIT GAME",     sys.exit, None)
     ]
 
@@ -340,16 +395,17 @@ def main(stdscr):
         cam_x += BG_SCROLL_SPEED_X
         cam_y += BG_SCROLL_SPEED_Y
 
-        # Determine BG
-        active_bg = bg_grid
+        active_data = bg_data
         if len(main_options[idx]) > 2 and main_options[idx][2]:
-            active_bg = main_options[idx][2]
+            active_data = main_options[idx][2]
+
+        if bg_data:
+            for p in bg_data[1]: p.update(0.05)
 
         labels = [opt[0] for opt in main_options]
-        draw_menu_frame(stdscr, active_bg, cam_x, cam_y, "TerminalFormer2", labels, idx)
+        draw_menu_frame(stdscr, active_data, cam_x, cam_y, "TerminalFormer2", labels, idx)
 
         key = stdscr.getch()
-
         if key == -1: continue
 
         if key == curses.KEY_UP:
@@ -360,14 +416,12 @@ def main(stdscr):
             func = main_options[idx][1]
             func()
 
-            # Restore state
             stdscr.clear()
             curses.curs_set(0)
             stdscr.nodelay(True)
             stdscr.timeout(30)
 
-            # Refresh BG in case they edited/played a level
-            bg_grid = load_random_level_grid()
+            bg_data = load_random_level_data()
 
         elif key in (ord('q'), ord('Q')):
             sys.exit(0)
