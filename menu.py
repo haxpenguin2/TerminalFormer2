@@ -55,8 +55,8 @@ def load_scores():
     return data
 
 def load_level_data(path):
-    """Returns: (grid_list, platform_object_list)"""
-    if not os.path.exists(path): return None, []
+    """Returns: (grid_list, platform_object_list, level_title)"""
+    if not os.path.exists(path): return None, [], "Unknown"
 
     try:
         with open(path, 'r') as f:
@@ -65,15 +65,15 @@ def load_level_data(path):
         parts = content.split("__METADATA__")
         lines = [l.rstrip("\n") for l in parts[0].strip().split('\n')]
 
-        if not lines: return None, []
+        if not lines: return None, [], "Empty"
 
         w = max(len(l) for l in lines)
         grid = [list(l.ljust(w, ' ')) for l in lines]
         platforms = []
+        title = os.path.basename(path) # Default to filename
 
         if len(parts) > 1:
             try:
-                # NEW: Handle List (Legacy) or Dict (New)
                 meta = json.loads(parts[1])
                 plat_data = []
 
@@ -81,6 +81,9 @@ def load_level_data(path):
                     plat_data = meta
                 elif isinstance(meta, dict):
                     plat_data = meta.get('platforms', [])
+                    # Extract title and clean quotes
+                    if "title" in meta:
+                        title = str(meta["title"]).replace('"', '')
 
                 for p in plat_data:
                     new_plat = MovingPlatform(p)
@@ -93,9 +96,9 @@ def load_level_data(path):
             except: pass
 
         grid_strs = ["".join(row) for row in grid]
-        return grid_strs, platforms
+        return grid_strs, platforms, title
 
-    except: return None, []
+    except: return None, [], "Error"
 
 def load_random_level_data():
     ensure_dirs()
@@ -120,7 +123,7 @@ def load_random_level_data():
         "#            TerminalFormer2           #",
         "#                                      #",
         "########################################"
-    ] * 5, [])
+    ] * 5, [], "Menu")
 
 # --- INPUT HELPER ---
 def get_string_input(stdscr, prompt):
@@ -145,7 +148,10 @@ def get_string_input(stdscr, prompt):
 # --- UNIFIED DRAWING ENGINE ---
 def draw_background(stdscr, level_data, cam_x, cam_y):
     if not level_data: return
-    grid, platforms = level_data
+    # Unpack safely (handle potential 2-tuple or 3-tuple)
+    grid = level_data[0]
+    platforms = level_data[1]
+    
     if not grid: return
 
     h, w = stdscr.getmaxyx()
@@ -290,11 +296,13 @@ def run_menu_loop(stdscr, default_bg_data, title, items):
 
         # --- UPDATE ALL PHYSICS ---
         if default_bg_data:
+             # default_bg_data is (grid, platforms, title)
              for p in default_bg_data[1]: p.update(0.05)
 
         for item in items:
             if len(item) > 2 and item[2]:
-                _, platforms = item[2]
+                # item[2] is (grid, platforms, title)
+                platforms = item[2][1]
                 for p in platforms:
                     p.update(0.05)
 
@@ -343,7 +351,11 @@ def menu_level_selector(stdscr, default_bg_data):
     for lvl in levels:
         full_path = os.path.join(LEVELS_DIR, lvl)
         lvl_data = load_level_data(full_path)
-        items.append( (lvl, lambda p=full_path: play_game(p), lvl_data) )
+        # Display: Title (filename.txt)
+        lvl_title = lvl_data[2]
+        display_name = f"{lvl_title} ({lvl})"
+        
+        items.append( (display_name, lambda p=full_path: play_game(p), lvl_data) )
 
     items.append( ("BACK", lambda: "BACK", None) )
     run_menu_loop(stdscr, default_bg_data, "SELECT CUSTOM LEVEL", items)
@@ -364,7 +376,13 @@ def menu_editor(stdscr, default_bg_data):
 
         for lvl in levels:
             full_path = os.path.join(LEVELS_DIR, lvl)
-            items.append( (f"EDIT: {lvl}", lambda l=lvl: open_editor_subprocess(l), None) )
+            lvl_data = load_level_data(full_path)
+            # Display: EDIT: Title (filename.txt)
+            lvl_title = lvl_data[2]
+            display_name = f"EDIT: {lvl_title} ({lvl})"
+            
+            # Now passing lvl_data to the 3rd tuple element allows background preview!
+            items.append( (display_name, lambda l=lvl: open_editor_subprocess(l), lvl_data) )
 
         items.append( ("BACK", lambda: "BACK", None) )
 
@@ -400,6 +418,7 @@ def main(stdscr):
             active_data = main_options[idx][2]
 
         if bg_data:
+            # bg_data[1] is platforms list
             for p in bg_data[1]: p.update(0.05)
 
         labels = [opt[0] for opt in main_options]
