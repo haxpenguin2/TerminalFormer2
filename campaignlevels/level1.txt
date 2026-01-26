@@ -24,4 +24,4 @@
 ████████████████████████████████████████████████████████████
 
 __METADATA__
-{"title": "\"Introduction To TerminalForming\"", "platforms": []}
+{"title": "Introduction", "platforms": []}

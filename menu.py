@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-import curses, os, sys, json, subprocess, random, time, math
+import curses, os, sys, json, subprocess, random, time, math, re
 
 # --- CONFIGURATION ---
 LEVELS_DIR = "levels"
 CAMPAIGN_DIR = "campaignlevels"
+PLUGINS_DIR = "plugins"
 SCORES_FILE = "scores.json"
 
 BG_SCROLL_SPEED_X = 1
 BG_SCROLL_SPEED_Y = 0
 
-# --- MOVING PLATFORM LOGIC (For Menu BG) ---
+# Map logic char -> visual char (e.g., 'B' -> '▒')
+PLUGIN_VISUALS = {}
+
+# --- MOVING PLATFORM LOGIC ---
 class MovingPlatform:
     def __init__(self, data):
         self.x_origin = data['x']
@@ -35,6 +39,52 @@ class MovingPlatform:
 
         self.x = self.x_origin + (offset * (self.limit_x / 2))
         self.y = self.y_origin + (offset * (self.limit_y / 2))
+
+# --- PLUGIN SYSTEM ---
+def strip_ansi(text):
+    """Removes ANSI color codes so Curses doesn't print garbage."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
+def load_plugins():
+    """Loads plugins to get their visual characters."""
+    global PLUGIN_VISUALS
+    PLUGIN_VISUALS = {}
+
+    if not os.path.exists(PLUGINS_DIR):
+        return
+
+    sys.path.append(PLUGINS_DIR)
+
+    for f in os.listdir(PLUGINS_DIR):
+        if f.endswith(".py") and f != "__init__.py":
+            mod_name = f[:-3]
+            try:
+                module = __import__(mod_name)
+                if hasattr(module, "register"):
+                    data = module.register()
+                    char = data.get("char")
+
+                    # Try to find the visual representation
+                    # Priority: runtime.display_char -> editor.display_char -> char
+                    visual = char
+
+                    if "runtime" in data and "display_char" in data["runtime"]:
+                        visual = data["runtime"]["display_char"]
+                    elif "editor" in data and "display_char" in data["editor"]:
+                        visual = data["editor"]["display_char"]
+
+                    # Ensure it's a string and strip ANSI codes for the menu
+                    if visual:
+                        clean_visual = strip_ansi(str(visual))
+                        # If the string became empty (e.g. purely color code), revert to original char
+                        if clean_visual:
+                            PLUGIN_VISUALS[char] = clean_visual
+                        else:
+                            PLUGIN_VISUALS[char] = char
+
+            except Exception as e:
+                pass
 
 # --- FILE OPERATIONS ---
 def ensure_dirs():
@@ -157,7 +207,7 @@ def draw_background(stdscr, level_data, cam_x, cam_y):
     grid_h = len(grid)
     grid_w = len(grid[0]) if grid_h > 0 else 0
 
-    # 1. Draw Static Grid
+    # 1. Draw Static Grid with Plugin Substitution
     for y in range(h):
         map_y = int(y + cam_y) % grid_h
         row_str = grid[map_y]
@@ -169,7 +219,16 @@ def draw_background(stdscr, level_data, cam_x, cam_y):
 
         while drawn_len < w:
             chunk_size = min(grid_w - current_x, w - drawn_len)
-            line_buffer += row_str[current_x : current_x + chunk_size]
+
+            # Get raw text chunk
+            raw_chunk = row_str[current_x : current_x + chunk_size]
+
+            # Translate characters using plugin map
+            display_chunk = ""
+            for char in raw_chunk:
+                display_chunk += PLUGIN_VISUALS.get(char, char)
+
+            line_buffer += display_chunk
             drawn_len += chunk_size
             current_x = 0
 
@@ -386,6 +445,7 @@ def menu_editor(stdscr, default_bg_data):
 def main(stdscr):
     curses.curs_set(0)
     ensure_dirs()
+    load_plugins() # Load visual overrides for 'B', 'J', etc.
 
     bg_data = load_random_level_data()
     cam_x, cam_y = 0.0, 0.0
@@ -433,6 +493,8 @@ def main(stdscr):
             stdscr.refresh()
             stdscr.timeout(30)
 
+            # Reload plugins/levels in case they changed during game/edit
+            load_plugins()
             bg_data = load_random_level_data()
 
         elif key in (ord('q'), ord('Q')):
