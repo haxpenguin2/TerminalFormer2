@@ -51,5 +51,9 @@ __METADATA__
       "spd": 2.0
     }
   ],
-  "block_overrides": {}
+  "block_overrides": {
+    "30,38": {
+      "boost": -50.0
+    }
+  }
 }
