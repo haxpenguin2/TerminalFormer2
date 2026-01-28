@@ -7,7 +7,7 @@ LEVELS_DIR = "levels"
 PLUGINS_DIR = "plugins"
 DEFAULT_FILE = "level1.txt"
 
-# Tile Constants
+# Default core tiles (editor still falls back to these when no plugin present)
 TILE_EMPTY = ' '
 TILE_SOLID = '█'
 TILE_SPIKE = '▲'
@@ -16,7 +16,7 @@ TILE_CHECKPOINT = 'C'
 TILE_SPAWN = 'S'
 TILE_GOAL = 'G'
 TILE_PLATFORM = '='
-TILE_BREAKABLE = 'B' # Added Breakable Block
+TILE_BREAKABLE = 'B'  # reserved if plugin not present
 
 # Color IDs
 class Colors:
@@ -33,9 +33,21 @@ class Colors:
     DIM = 11
     BREAKABLE = 12
 
-# Global State for Plugins
-BLOCK_REGISTRY = {}
-PLUGIN_LIST = []
+    # Map string names to IDs for plugins
+    NAME_MAP = {
+        "WHITE": SOLID,
+        "RED": DANGER,
+        "GREEN": SPECIAL,
+        "CYAN": UI,
+        "YELLOW": PLATFORM_EDIT,
+        "MAGENTA": BREAKABLE,
+        "BLUE": DIM,
+        "DEFAULT": DEFAULT
+    }
+
+# Global plugin registry (populated by load_plugins)
+BLOCK_REGISTRY = {}   # char -> meta
+PLUGIN_LIST = []      # list of metas
 BRUSHES = [
     (TILE_SOLID, "SOLID"),
     (TILE_BREAKABLE, "BREAKABLE"),
@@ -48,42 +60,78 @@ BRUSHES = [
     (TILE_EMPTY, "ERASER (Brush #9)")
 ]
 
+# Map hotkey ord -> brush index (populated by load_plugins)
+HOTKEY_MAP = {}
+
 # --- UTILS: FILE IO & PLUGINS ---
 def ensure_dirs():
     for d in [LEVELS_DIR, PLUGINS_DIR]:
         os.makedirs(d, exist_ok=True)
 
+def _load_module_from_path(path):
+    name = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(f"plugins.{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 def load_plugins():
-    """Dynamic plugin loader."""
-    global BLOCK_REGISTRY, PLUGIN_LIST, BRUSHES
+    """Dynamic plugin loader. Accepts module.register() -> dict or list."""
+    global BLOCK_REGISTRY, PLUGIN_LIST, BRUSHES, HOTKEY_MAP
     ensure_dirs()
     BLOCK_REGISTRY.clear()
     PLUGIN_LIST.clear()
-    # Reset brushes to core + eraser
-    core_brushes = BRUSHES[:8] # Keep first 8
+    HOTKEY_MAP.clear()
 
+    # Core brushes (we'll append plugin brushes after discovery)
+    core_brushes = [
+        (TILE_SOLID, "SOLID"),
+        (TILE_BREAKABLE, "BREAKABLE"),
+        (TILE_SPIKE, "SPIKE UP"),
+        (TILE_SPIKE_DOWN, "SPIKE DOWN"),
+        (TILE_CHECKPOINT, "CHECKPOINT"),
+        (TILE_SPAWN, "SPAWN"),
+        (TILE_GOAL, "GOAL"),
+        (TILE_PLATFORM, "PLATFORM (Select -> P)")
+    ]
+
+    # Discover plugin files
     for path in glob.glob(os.path.join(PLUGINS_DIR, "*.py")):
-        name = os.path.splitext(os.path.basename(path))[0]
         try:
-            spec = importlib.util.spec_from_file_location(f"plugins.{name}", path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            if hasattr(module, "register") and callable(module.register):
-                meta = module.register()
-                if not isinstance(meta, dict): continue
-                ch = meta.get("char") or meta.get("editor", {}).get("char") or meta.get("id")
+            mod = _load_module_from_path(path)
+            if not hasattr(mod, "register") or not callable(mod.register):
+                continue
+            meta = mod.register()
+            metas = meta if isinstance(meta, list) else [meta]
+            for m in metas:
+                if not isinstance(m, dict): continue
+                ch = m.get("char") or m.get("id") or None
+                ed = m.get("editor") or {}
+                if not isinstance(ed, dict):
+                    ed = {}
+                    m["editor"] = ed
+                # sensible defaults
+                ed.setdefault("display_char", ch if isinstance(ch, str) else ed.get("display_char", "?"))
+                ed.setdefault("brush_name", ed.get("brush_name") or m.get("name") or (f"PLUGIN {ch}" if ch else "PLUGIN"))
+                PLUGIN_LIST.append(m)
                 if isinstance(ch, str) and len(ch) == 1:
-                    BLOCK_REGISTRY[ch] = meta
-                    if "editor" in meta: meta["editor"].setdefault("display_char", ch)
-                    brush_name = meta.get("editor", {}).get("brush_name")
-                    if brush_name: core_brushes.append((ch, brush_name))
-                PLUGIN_LIST.append(meta)
+                    BLOCK_REGISTRY[ch] = m
+                    brush_name = ed.get("brush_name")
+                    if brush_name:
+                        core_brushes.append((ch, brush_name))
         except Exception as e:
-            print(f"Plugin Error [{name}]: {e}", file=sys.stderr)
+            print(f"Plugin Error [{path}]: {e}", file=sys.stderr)
 
-    # Add Eraser last
+    # Add eraser last
     core_brushes.append((TILE_EMPTY, "ERASER"))
     BRUSHES = core_brushes
+
+    # Build HOTKEY_MAP
+    for i, (ch, name) in enumerate(BRUSHES):
+        if ch in BLOCK_REGISTRY:
+            hotk = BLOCK_REGISTRY[ch].get("editor", {}).get("hotkey")
+            if isinstance(hotk, str) and len(hotk) == 1:
+                HOTKEY_MAP[ord(hotk)] = i
 
 # --- UTILS: RENDERING HELPERS ---
 def safe_addch(stdscr, y, x, ch, attr=0):
@@ -123,7 +171,7 @@ def get_string_input(stdscr, prompt, default=""):
     val = default
     try:
         safe_addstr(stdscr, by + 4, bx + 13, " " * 30, curses.color_pair(Colors.UI))
-        inp = stdscr.getstr(by + 4, bx + 13, 20).decode('utf-8')
+        inp = stdscr.getstr(by + 4, bx + 13, 30).decode('utf-8')
         if inp.strip(): val = inp.strip()
     except: pass
     curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
@@ -146,7 +194,7 @@ class Editor:
         self.mode = 'PAINT'
         self.brush_idx = 0
         self.sel_anchor = None
-        self.clipboard = None # Now holds complex dict
+        self.clipboard = None
 
         # System
         self.msg = f"Loaded {filename}"
@@ -165,7 +213,7 @@ class Editor:
             try:
                 with open(path, 'r') as f: content = f.read()
                 parts = content.split('__METADATA__')
-                lines = [l.rstrip('\n') for l in parts[0].strip().split('\n')]
+                lines = [l.rstrip('\n') for l in parts[0].strip().split('\n') if l != ""]
                 if lines:
                     fw = max(len(l) for l in lines)
                     self.grid = [list(l.ljust(fw, ' ')) for l in lines]
@@ -174,13 +222,12 @@ class Editor:
                     if isinstance(data, dict):
                         self.meta = data
                         self.platforms = data.get('platforms', [])
-                        # Ensure overrides exist
                         if "block_overrides" not in self.meta:
                             self.meta["block_overrides"] = {}
             except Exception as e:
                 self.msg = f"Load Error: {e}"
 
-        # Clean up visual representation of platforms
+        # Draw platforms visually
         for p in self.platforms:
             px, py, pw = int(p['x']), int(p['y']), int(p['w'])
             if 0 <= py < len(self.grid):
@@ -193,14 +240,12 @@ class Editor:
         valid_platforms = []
         for p in self.platforms:
             try:
-                # Only save platforms that still exist visually on grid
                 if self.grid[int(p['y'])][int(p['x'])] == TILE_PLATFORM:
                     valid_platforms.append(p)
             except IndexError: pass
 
         export_lines = []
         for row in self.grid:
-            # Convert visual platform tiles to solid for generic viewers
             line = "".join([TILE_SOLID if c == TILE_PLATFORM else c for c in row])
             export_lines.append(line.rstrip())
 
@@ -231,6 +276,14 @@ class Editor:
         return TILE_EMPTY
 
     def paint(self, x, y, brush=None):
+        """
+        Fully dynamic paint:
+        - If brush corresponds to a plugin, call plugin.editor.on_paint()
+          and accept string or dict return:
+            - str -> place first char
+            - dict -> must contain "char", optional "meta" to store in level metadata
+        - Otherwise, place brush char literally.
+        """
         if brush is None: brush = BRUSHES[self.brush_idx][0]
         w, h = self.get_dims()
         if not (0 <= y < h and 0 <= x < w): return
@@ -241,15 +294,29 @@ class Editor:
         if brush == TILE_EMPTY and prev == TILE_PLATFORM:
             self.platforms = [p for p in self.platforms if not (p['y'] == y and p['x'] <= x < p['x'] + p['w'])]
 
-        # Plugin Paint Hook
+        # Plugin Paint Hook (plugin can return a char or dict)
         plugin = BLOCK_REGISTRY.get(brush)
         if plugin and 'editor' in plugin and callable(plugin['editor'].get('on_paint')):
             try:
                 val = plugin['editor']['on_paint'](self, x, y)
-                if val and isinstance(val, str):
-                    self.grid[y][x] = val[0]; return
-            except: pass
+                if isinstance(val, str) and val:
+                    self.grid[y][x] = val[0]
+                    # drop any metadata change if not provided
+                    return
+                if isinstance(val, dict) and "char" in val:
+                    ch = val.get("char")
+                    if isinstance(ch, str) and ch:
+                        self.grid[y][x] = ch[0]
+                        meta = val.get("meta")
+                        if isinstance(meta, dict):
+                            key = f"{x},{y}"
+                            if "block_overrides" not in self.meta: self.meta["block_overrides"] = {}
+                            self.meta["block_overrides"][key] = meta
+                        return
+            except Exception:
+                pass
 
+        # Default painting
         self.grid[y][x] = brush
 
         # Clean up metadata if overwriting
@@ -449,26 +516,44 @@ class Editor:
         ch = self.get_cell(self.cx, self.cy)
         plugin = BLOCK_REGISTRY.get(ch)
 
-        # If it's a generic block, we might want to edit manual overrides
-        if ch == TILE_BREAKABLE or (plugin and 'editor' in plugin):
+        if plugin and 'editor' in plugin:
+            try:
+                if callable(plugin['editor'].get('on_context')):
+                    # plugin's on_context receives: editor, gx, gy, get_string_input
+                    plugin['editor']['on_context'](self, self.cx, self.cy, lambda p,d: get_string_input(stdscr, p, d))
+                    self.msg = "Updated Block Data"
+                    return
+            except Exception as e:
+                self.msg = f"Error: {e}"
+                return
+
+        # Default breakable logic fallback (keeps compatibility)
+        if ch == TILE_BREAKABLE:
             key = f"{self.cx},{self.cy}"
             curr_hp = self.meta["block_overrides"].get(key, {}).get("hp", 1)
-
             try:
-                # If plugin has specific context, use it
-                if plugin and callable(plugin['editor'].get('on_context')):
-                    plugin['editor']['on_context'](self, self.cx, self.cy, lambda p, d: get_string_input(stdscr, p, d))
-                else:
-                    # Default Breakable Logic
-                    new_hp = get_string_input(stdscr, "Block HP", str(curr_hp))
-                    if "block_overrides" not in self.meta: self.meta["block_overrides"] = {}
-                    self.meta["block_overrides"][key] = {"hp": int(new_hp)}
+                new_hp = get_string_input(stdscr, "Block HP", str(curr_hp))
+                if "block_overrides" not in self.meta: self.meta["block_overrides"] = {}
+                self.meta["block_overrides"][key] = {"hp": int(new_hp)}
                 self.msg = "Updated Block Data"
-            except Exception as e: self.msg = f"Error: {e}"
-        else: self.msg = "No Settings"
+            except Exception as e:
+                self.msg = f"Error: {e}"
+        else:
+            self.msg = "No Settings"
+
+    def get_selection_bounds(self):
+        if not self.sel_anchor: return None
+        x1, y1 = self.sel_anchor
+        return (min(x1, self.cx), min(y1, self.cy), max(x1, self.cx), max(y1, self.cy))
+
+    def get_platform_at(self, x, y):
+        for p in self.platforms:
+            if p['y'] == y and p['x'] <= x < p['x'] + p['w']: return p
+        return None
 
 # --- MAIN RENDER & LOOP ---
 def main(stdscr):
+    # init colors
     curses.start_color(); curses.use_default_colors()
     curses.init_pair(Colors.SOLID, curses.COLOR_WHITE, -1)
     curses.init_pair(Colors.DANGER, curses.COLOR_RED, -1)
@@ -485,6 +570,8 @@ def main(stdscr):
     curses.curs_set(0); stdscr.nodelay(True)
     filename = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_FILE
     editor = Editor(filename)
+
+    # load plugins *after* Editor constructed so plugin hooks can reference editor methods if necessary
     load_plugins()
     show_help = False
 
@@ -499,10 +586,11 @@ def main(stdscr):
             if k in (ord('h'), ord('?'), 27): show_help = False
             continue
 
+        # camera follow
         if editor.cx < editor.cam_x + 2: editor.cam_x = max(0, editor.cx - 2)
         if editor.cx >= editor.cam_x + w - 2: editor.cam_x = editor.cx - (w - 3)
         if editor.cy < editor.cam_y + 2: editor.cam_y = max(0, editor.cy - 2)
-        if editor.cy >= editor.cam_y + h - 6: editor.cam_y = editor.cy - (h - 7)
+        if editor.cy >= editor.cam_y + h - 6: editor.cy = editor.cy - (h - 7)
         off_x = (w - gw) // 2 if gw < w else -editor.cam_x
         off_y = (h - gh) // 2 if gh < h - 4 else -editor.cam_y
 
@@ -519,16 +607,23 @@ def main(stdscr):
                 disp_char = char
                 col_id = Colors.DEFAULT
 
-                # Plugin Display
+                # Plugin Display: use plugin editor.display_char if present
                 if char in BLOCK_REGISTRY:
                     ed_cfg = BLOCK_REGISTRY[char].get('editor', {})
                     disp_char = ed_cfg.get('display_char', char)
 
-                if disp_char == TILE_SOLID: col_id = Colors.SOLID
-                elif disp_char in (TILE_SPIKE, TILE_SPIKE_DOWN): col_id = Colors.DANGER
-                elif disp_char == TILE_BREAKABLE: col_id = Colors.BREAKABLE
-                elif disp_char in (TILE_SPAWN, TILE_GOAL, TILE_CHECKPOINT): col_id = Colors.SPECIAL
-                elif char == TILE_PLATFORM: col_id = Colors.PLATFORM_EDIT; disp_char = TILE_SOLID
+                    # NEW: Support custom colors from plugins
+                    custom_col = ed_cfg.get('color')
+                    if custom_col and custom_col in Colors.NAME_MAP:
+                        col_id = Colors.NAME_MAP[custom_col]
+
+                # Fallback to hardcoded logic only if no plugin color was set
+                if col_id == Colors.DEFAULT:
+                    if disp_char == TILE_SOLID: col_id = Colors.SOLID
+                    elif disp_char in (TILE_SPIKE, TILE_SPIKE_DOWN): col_id = Colors.DANGER
+                    elif disp_char == TILE_BREAKABLE: col_id = Colors.BREAKABLE
+                    elif disp_char in (TILE_SPAWN, TILE_GOAL, TILE_CHECKPOINT): col_id = Colors.SPECIAL
+                    elif char == TILE_PLATFORM: col_id = Colors.PLATFORM_EDIT; disp_char = TILE_SOLID
 
                 attr = curses.color_pair(col_id)
                 if bounds and (bounds[0] <= c <= bounds[2] and bounds[1] <= r <= bounds[3]):
@@ -537,7 +632,7 @@ def main(stdscr):
                     attr = curses.color_pair(Colors.CURSOR) | curses.A_BOLD
                 safe_addch(stdscr, scr_y, off_x + c, disp_char, attr)
 
-        # Physics Preview
+        # Physics Preview (unchanged)
         if editor.mode == 'PREVIEW':
             dt = time.time() - editor.start_time
             for p in editor.platforms:
@@ -563,19 +658,19 @@ def main(stdscr):
             editor.msg_timer -= 1
             if editor.msg_timer <= 0: editor.msg = None
 
+        # Draw brush info (dynamic)
         if editor.mode != 'PREVIEW':
-            bc, bn = BRUSHES[editor.brush_idx]
+            bc, bn = BRUSHES[editor.brush_idx] if editor.brush_idx < len(BRUSHES) else (TILE_EMPTY, "ERASER")
             d = TILE_SOLID if bc == TILE_PLATFORM else bc
             safe_addstr(stdscr, h-4, 1, f"BRUSH: [{d}] {bn}", curses.color_pair(Colors.SOLID) | curses.A_BOLD)
 
-            # Show Block Metadata under cursor
             meta_key = f"{editor.cx},{editor.cy}"
             if meta_key in editor.meta["block_overrides"]:
                 info = str(editor.meta["block_overrides"][meta_key])
                 safe_addstr(stdscr, h-4, 30, f"DATA: {info}", curses.color_pair(Colors.SPECIAL))
 
             instr = ""
-            if editor.mode == 'PAINT': instr = "TAB: Select | 0: Preview | SPACE: Paint | R: Resize | S: Save"
+            if editor.mode == 'PAINT': instr = "TAB: Select | 1-9 / plugin hotkeys: Brush | 0: Preview | SPACE: Paint | R: Resize | S: Save"
             elif editor.mode == 'SELECT': instr = "SPACE: Anchor | C/V: Copy/Paste | F/X: Fill/Del | M: Move | P: Platform"
             elif editor.mode == 'MOVE': instr = "ARROWS: Move | ENTER: Confirm"
             safe_addstr(stdscr, h-2, 1, instr, curses.color_pair(Colors.DIM))
@@ -593,19 +688,26 @@ def main(stdscr):
             continue
         if editor.mode == 'PREVIEW': continue
 
-        # Cursor Move
-        if k == curses.KEY_UP: editor.cy = max(0, editor.cy - 1)
-        elif k == curses.KEY_DOWN: editor.cy = min(gh - 1, editor.cy + 1)
-        elif k == curses.KEY_LEFT: editor.cx = max(0, editor.cx - 1)
-        elif k == curses.KEY_RIGHT: editor.cx = min(gw - 1, editor.cx + 1)
+        # plugin hotkeys: map directly to brush
+        if k in HOTKEY_MAP and HOTKEY_MAP[k] is not None:
+            editor.brush_idx = HOTKEY_MAP[k]
+            continue
 
         # Actions
-        elif editor.mode == 'MOVE':
+        # FIXED LOGIC: CHECK MOVE MODE FIRST!
+        # This ensures Arrow Keys are caught by the 'MOVE' logic before standard cursor logic.
+        if editor.mode == 'MOVE':
             if k == curses.KEY_UP: editor.move_selection(0, -1)
             elif k == curses.KEY_DOWN: editor.move_selection(0, 1)
             elif k == curses.KEY_LEFT: editor.move_selection(-1, 0)
             elif k == curses.KEY_RIGHT: editor.move_selection(1, 0)
             elif k in (10, 13): editor.mode = 'SELECT'; editor.msg = "Placed"
+
+        # Cursor Move (Only if not in MOVE mode)
+        elif k == curses.KEY_UP: editor.cy = max(0, editor.cy - 1)
+        elif k == curses.KEY_DOWN: editor.cy = min(gh - 1, editor.cy + 1)
+        elif k == curses.KEY_LEFT: editor.cx = max(0, editor.cx - 1)
+        elif k == curses.KEY_RIGHT: editor.cx = min(gw - 1, editor.cx + 1)
 
         elif editor.mode == 'PAINT':
             if k == 9: editor.mode = 'SELECT'
@@ -639,11 +741,11 @@ def main(stdscr):
 def draw_help_menu(stdscr):
     sections = [
         ("GLOBAL", [("H/?", "Help"), ("TAB", "Mode"), ("0", "Preview"), ("S", "Save"), ("Q", "Quit")]),
-        ("PAINT", [("1-9", "Brush"), ("SPACE", "Paint"), ("E", "Edit Data"), ("P", "Platform")]),
+        ("PAINT", [("1-9", "Brush"), ("plugin hotkeys", "Direct brush"), ("SPACE", "Paint"), ("E", "Edit Data"), ("P", "Platform")]),
         ("SELECT", [("SPACE", "Anchor"), ("C/V", "Copy/Paste"), ("M", "Move"), ("P", "Platform")])
     ]
     h, w = stdscr.getmaxyx()
-    box_w, box_h = 60, sum(len(s[1]) + 2 for s in sections) + 4
+    box_w, box_h = 72, sum(len(s[1]) + 2 for s in sections) + 4
     bx, by = (w - box_w) // 2, (h - box_h) // 2
     for y in range(by, by+box_h): safe_addstr(stdscr, y, bx, " " * box_w, curses.color_pair(Colors.UI))
     safe_addstr(stdscr, by, bx, "+" + "-"*(box_w-2) + "+", curses.color_pair(Colors.UI))
@@ -657,5 +759,7 @@ def draw_help_menu(stdscr):
         cy += 1
 
 if __name__ == "__main__":
-    try: curses.wrapper(main)
-    except Exception as e: print(f"Fatal Error: {e}")
+    try:
+        curses.wrapper(main)
+    except Exception as e:
+        print(f"Fatal Error: {e}")

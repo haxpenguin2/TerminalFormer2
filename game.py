@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# game.py - optimized platformer
+# game.py - The "Who is the Killer?" Edition
 import curses, time, os, math, sys, json, glob, importlib.util
 from collections import deque
 
@@ -15,6 +15,7 @@ PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
 REGISTRY, PLUGINS = {}, []
 def load_plugins():
     if not os.path.exists(DIRS['PLUGINS']): os.makedirs(DIRS['PLUGINS'], exist_ok=True)
+    print("Loading plugins...")
     for path in glob.glob(os.path.join(DIRS['PLUGINS'], "*.py")):
         try:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -22,11 +23,16 @@ def load_plugins():
             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
             if hasattr(mod, "register"):
                 meta = mod.register()
-                if not isinstance(meta, dict): continue
-                ch = meta.get("char") or meta.get("id")
-                PLUGINS.append(meta)
-                if isinstance(ch, str) and len(ch) == 1: REGISTRY[ch] = meta
-        except: pass
+                metas = meta if isinstance(meta, list) else [meta]
+                for m in metas:
+                    if not isinstance(m, dict): continue
+                    ch = m.get("char") or m.get("id")
+                    PLUGINS.append(m)
+                    if isinstance(ch, str) and len(ch) == 1:
+                        REGISTRY[ch] = m
+                        print(f" - Loaded '{name}' for character [{ch}]")
+        except Exception as e: print(f"Failed to load {path}: {e}")
+
 load_plugins()
 
 def get_plugin(ch): return REGISTRY.get(ch)
@@ -50,6 +56,7 @@ class InputEngine:
     def __init__(self):
         self.keys = {k: False for k in ['LEFT', 'RIGHT', 'UP', 'DOWN', 'JUMP', 'RESET', 'QUIT', 'CONTINUE']}
         self.pressed = set()
+        self.evdev_state = {k: False for k in self.keys}
         self.dev = evdev_input.EvdevInput() if HAS_EVDEV else None
 
     def update(self, stdscr):
@@ -57,20 +64,22 @@ class InputEngine:
             for t, v in self.dev.poll(0.0):
                 k = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','SPACE':'JUMP','R':'RESET','Q':'QUIT','CONTINUE':'CONTINUE'}.get(t)
                 if k:
-                    if v == 1: self.pressed.add(k); self.keys[k] = True
-                    elif v == 0: self.keys[k] = False
-        else:
-            for k in self.keys: self.keys[k] = False # Polling reset
+                    if v == 1: self.pressed.add(k); self.evdev_state[k] = True
+                    elif v == 0: self.evdev_state[k] = False
+
+        curses_keys = {k: False for k in self.keys}
         try:
             while (k := stdscr.getch()) != -1:
                 n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP', ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT'}.get(k)
                 if n:
-                    self.keys[n] = True; self.pressed.add(n)
-                    if n == 'JUMP': self.keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
+                    curses_keys[n] = True; self.pressed.add(n)
+                    if n == 'JUMP': curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
         except: pass
 
+        for k in self.keys: self.keys[k] = self.evdev_state[k] or curses_keys[k]
+
     def reset(self):
-        self.keys = {k: False for k in self.keys}
+        for k in self.keys: self.keys[k] = False; self.evdev_state[k] = False
         self.pressed.clear()
 
     def was(self, k): return k in self.pressed
@@ -96,27 +105,32 @@ class Platform:
 
 # --- PHYSICS & LOADING ---
 def load_level(path):
-    if not os.path.exists(path): return None, [], "UNKNOWN"
+    if not os.path.exists(path): return None, [], "UNKNOWN", {}
     with open(path) as f: parts = f.read().split("__METADATA__")
-    lines = [l.rstrip("\n") for l in parts[0].strip().split('\n')]
+    lines = [l.rstrip("\r\n") for l in parts[0].strip().split('\n') if l != ""]
     w = max(len(l) for l in lines) if lines else 0
     grid = [list(l.ljust(w, ' ')) for l in lines]
     plats, title = [], os.path.splitext(os.path.basename(path))[0]
+    meta = {}
     if len(parts) > 1:
         try:
             d = json.loads(parts[1])
-            title = str(d.get("title", title)).replace('"', '')
-            for p in (d.get("platforms", []) if isinstance(d, dict) else d):
-                plats.append(Platform(p))
-                for i in range(p['w']):
-                    gy, gx = int(p['y']), int(p['x']) + i
-                    if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]): grid[gy][gx] = ' '
+            if isinstance(d, dict):
+                meta = d
+                title = str(d.get("title", title)).replace('"', '')
+                for p in d.get("platforms", []):
+                    plats.append(Platform(p))
+                    for i in range(p['w']):
+                        gy, gx = int(p['y']), int(p['x']) + i
+                        if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]): grid[gy][gx] = ' '
         except: pass
-    return grid, plats, title
+    return grid, plats, title, meta
 
 def is_solid(grid, x, y):
     if 0 <= y < len(grid) and 0 <= x < len(grid[0]):
-        ch, p = grid[int(y)][int(x)], get_plugin(grid[int(y)][int(x)])
+        ch = grid[int(y)][int(x)]
+        if ch in ('C', 'S', 'G', ' '): return False
+        p = get_plugin(ch)
         if p and 'runtime' in p:
             s = p['runtime'].get('solid')
             return bool(s(grid, x, y)) if callable(s) else bool(s)
@@ -124,6 +138,7 @@ def is_solid(grid, x, y):
     return True
 
 def check_rect(grid, l, t, r, b):
+    # This checks for ANY solid block in the rect
     for y in range(int(math.floor(t)), int(math.floor(b)) + 1):
         for x in range(int(math.floor(l)), int(math.floor(r)) + 1):
             if is_solid(grid, x, y): return True
@@ -155,7 +170,6 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle
     sx = int(max(0, min(cx, max(0, gw - w)))) if gw >= w else 0
     sy = int(max(0, min(cy, max(0, gh - h)))) if gh >= h else 0
 
-    # Draw Map
     for scr_y in range(h):
         my = scr_y - oy + sy
         if 0 <= my < gh:
@@ -166,7 +180,6 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle
                 try: stdscr.addstr(scr_y, max(0, ox), ln)
                 except: pass
 
-    # Draw Platforms
     for p in plats:
         spx, spy = int(p.x - sx) + ox, int(p.y - sy) + oy
         if 0 <= spy < h:
@@ -175,13 +188,11 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle
                 try: stdscr.addstr(spy, max(0, spx), TILES['SOLID'] * int(dl), curses.A_BOLD)
                 except: pass
 
-    # Draw Player
     spx, spy = int(px - sx) + ox, int(py - sy) + oy
     if vis and 0 <= spx < w and 0 <= spy < h:
         try: stdscr.addch(spy, spx, TILES['PLAYER'], curses.A_BOLD)
         except: pass
 
-    # UI
     try:
         if not msg: stdscr.addstr(0, 0, f"LEVEL {lnum} \"{ltitle}\"", curses.A_BOLD)
         else: stdscr.addstr(0, 1, msg, curses.A_REVERSE | curses.A_BOLD)
@@ -192,18 +203,27 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle
 
 # --- MAIN LOOP ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0):
-    grid, plats, title = load_level(level_file)
+    grid, plats, title, meta = load_level(level_file)
     if not grid: return "NO_FILE", 0.0
 
     px, py = 1.5, 1.5
-    for y, r in enumerate(grid):
-        if TILES['SPAWN'] in r: px, py = r.index(TILES['SPAWN']) + 0.5, y + 0.5
+    start_cp = None # Track original spawn point
+    for y, row in enumerate(grid):
+        for x, cell in enumerate(row):
+            if cell == TILES['SPAWN']:
+                px, py = x + 0.5, y + 0.5
+                start_cp = (x + 0.5, y + 0.5)
+                grid[y][x] = ' ' # Clear Spawn, keep CP
 
-    cp, vx, vy, cx, cy = (px, py), 0.0, 0.0, 0, 0
+    if start_cp is None: start_cp = (px, py)
+    cp, vx, vy, cx, cy = start_cp, 0.0, 0.0, 0, 0
     fps_h = deque(maxlen=30)
     start, last, cur_t, msg, mend = time.time(), time.time(), 0.0, None, 0
     ap, ap_off = None, 0.0
     stdscr.nodelay(True)
+
+    def make_game_state():
+        return {"grid": grid, "platforms": plats, "level": title, "meta": meta}
 
     while True:
         inp.update(stdscr)
@@ -226,13 +246,12 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0):
             px, py, vx, vy, ap = cp[0], cp[1] - 0.1, 0, 0, None
             for m in PLUGINS:
                 if callable(f := m.get('runtime', {}).get('on_player_death')):
-                    try: f({"grid": grid, "level": title})
+                    try: f(make_game_state(), {})
                     except: pass
 
         ground = check_rect(grid, px - PHYS['HW'], py + PHYS['HH'], px + PHYS['HW'], py + PHYS['HH'] + 0.05)
         idir = (inp.down('RIGHT') - inp.down('LEFT'))
 
-        # Physics
         if ap: # Attached
             if inp.was('JUMP'): vy, px, ap = JUMP_V, ap.x + ap_off, None
             else:
@@ -244,24 +263,23 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0):
                     if check_rect(grid, wx - PHYS['HW'], wy - PHYS['HH'] + 0.1, wx + PHYS['HW'], wy + PHYS['HH'] - 0.1): break
                     cur = nxt
                 ap_off, px, py, vy = cur, ap.x + cur, ap.y - PHYS['HH'] - PHYS['TOL'], 0
+                if ap_off + PHYS['HW'] <= 0 or ap_off - PHYS['HW'] >= ap.w: ap = None
 
-                # Check if player bounds have left the platform bounds
-                if ap_off + PHYS['HW'] <= 0 or ap_off - PHYS['HW'] >= ap.w:
-                    ap = None
-
-                # Support hook
                 sy = int(py + PHYS['HH'] + 0.05)
                 for lx in {int(px), int(px - PHYS['HW'] + 0.1), int(px + PHYS['HW'] - 0.1)}:
-                    if (p := get_plugin(grid[sy][lx] if 0<=sy<len(grid) and 0<=lx<len(grid[0]) else ' ')):
-                        if callable(f := p.get('runtime', {}).get('on_player_supported')):
-                            try: f({"dt": dt, "grid": grid, "level": title}, {"px": px, "py": py}, lx, sy, {})
+                    if 0<=sy<len(grid) and 0<=lx<len(grid[0]):
+                        pmeta = get_plugin(grid[sy][lx])
+                        if pmeta and callable(f := pmeta.get('runtime', {}).get('on_player_supported')):
+                            try:
+                                pstate = {"px": px, "py": py, "vx": vx, "vy": vy}
+                                f({"dt": dt, "grid": grid, "level": title, "meta": meta}, pstate, lx, sy, {})
+                                vx = float(pstate.get("vx", vx)); vy = float(pstate.get("vy", vy))
                             except: pass
         else: # Detached
             if inp.was('JUMP') and ground: vy = JUMP_V
             else: vy += GRAVITY * dt
             vx = idir * MOVE_SPEED
 
-            # X Step
             rem = dt
             while rem > 0:
                 step = min(rem, MAX_SUBSTEP); rem -= step
@@ -270,58 +288,83 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0):
                 elif check_plat(plats, npx - PHYS['HW'], py - PHYS['HH'] + 0.1, npx + PHYS['HW'], py + PHYS['HH'] - 0.1): vx = 0
                 else: px = npx
 
-            # Y Step
             rem = dt
             while rem > 0:
                 step = min(rem, MAX_SUBSTEP); rem -= step
                 npy = py + vy * step
                 if check_rect(grid, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH']):
-                    if vy > 0: # Land on Static
+                    if vy > 0:
                         ly = int(math.floor(npy + PHYS['HH']))
                         py, vy = ly - PHYS['HH'] - 0.001, 0
                         for lx in {int(px), int(px - PHYS['HW'] + 0.01), int(px + PHYS['HW'] - 0.01)}:
-                            if (p := get_plugin(grid[ly][lx] if 0<=ly<len(grid) and 0<=lx<len(grid[0]) else ' ')):
-                                if callable(f := p.get('runtime', {}).get('on_player_supported')):
-                                    try: f({"dt": step, "grid": grid, "level": title}, {"px": px, "py": py}, lx, ly, {})
+                            if 0<=ly<len(grid) and 0<=lx<len(grid[0]):
+                                pmeta = get_plugin(grid[ly][lx])
+                                if pmeta and callable(f := pmeta.get('runtime', {}).get('on_player_supported')):
+                                    try:
+                                        pstate = {"px": px, "py": py, "vx": vx, "vy": vy}
+                                        f({"dt": step, "grid": grid, "level": title, "meta": meta}, pstate, lx, ly, {})
+                                        vx = float(pstate.get("vx", vx)); vy = float(pstate.get("vy", vy))
                                     except: pass
                     elif vy < 0: py, vy = math.floor(npy - PHYS['HH']) + PHYS['HH'] + 1.001, 0
                 else:
-                    # --- FIXED PLATFORM COLLISION ---
                     hit = check_plat(plats, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH'])
                     if hit:
-                        if vy > 0: # Falling: Land on top
-                            ap, ap_off, py, vy = hit, px - hit.x, hit.y - PHYS['HH'] - PHYS['TOL'], 0
-                        elif vy < 0: # Jumping: Hit Head on Bottom
-                            py = hit.y + 1.0 + PHYS['HH'] + PHYS['TOL']
-                            vy = 0
-                    else:
-                        py = npy
-                    # --------------------------------
+                        if vy > 0: ap, ap_off, py, vy = hit, px - hit.x, hit.y - PHYS['HH'] - PHYS['TOL'], 0
+                        elif vy < 0: py, vy = hit.y + 1.0 + PHYS['HH'] + PHYS['TOL'], 0
+                    else: py = npy
 
         # Interactions
         icx, icy = int(px), int(py)
-        crush = check_rect(grid, px - PHYS['HW'] + 0.2, py - PHYS['HH'] + 0.2, px + PHYS['HW'] - 0.2, py + PHYS['HH'] - 0.2)
+
+        # --- FIXED & DEBUGGED DEATH LOGIC ---
+        # 1. Crush: Only if CENTER POINT is in wall.
+        crush = is_solid(grid, px, py)
+
+        # 2. Safe Zone: Check strict distance to CP to cover Spawn area too.
+        dist_to_cp = math.sqrt((px - cp[0])**2 + (py - cp[1])**2)
+        is_safe = (dist_to_cp < 1.0)
+
         tile = grid[icy][icx] if (0 <= icy < len(grid) and 0 <= icx < len(grid[0])) else ' '
+
+        if tile == TILES['GOAL']: return "NEXT_LEVEL", cur_t
+
+        tp = get_plugin(tile)
+        if tp and 'runtime' in tp:
+            touch = tp['runtime'].get('on_player_touch')
+            if callable(touch):
+                try:
+                    pstate = {"px": px, "py": py, "vx": vx, "vy": vy}
+                    ret = touch({"grid": grid, "platforms": plats, "player": {"px": px, "py": py, "vx": vx, "vy": vy}, "level": title, "meta": meta}, pstate, icx, icy, {})
+                    vx = float(pstate.get("vx", vx)); vy = float(pstate.get("vy", vy))
+                    if isinstance(ret, dict):
+                        if "vx" in ret: vx = float(ret["vx"])
+                        if "vy" in ret: vy = float(ret["vy"])
+                except: pass
+
         tp = get_plugin(tile)
         deadly = bool(tp['runtime'].get('deadly', False)) if tp and 'runtime' in tp else False
         if tp and 'runtime' in tp and callable(f := tp['runtime'].get('on_player_collide')):
-             try: f({"grid": grid, "platforms": plats, "player": {"px": px, "py": py, "vx": vx, "vy": vy}, "level": title}, {"px": px, "py": py, "vx": vx, "vy": vy}, icx, icy, {})
+             try: f({"grid": grid, "platforms": plats, "player": {"px": px, "py": py, "vx": vx, "vy": vy}, "level": title, "meta": meta}, {"px": px, "py": py, "vx": vx, "vy": vy}, icx, icy, {})
              except: pass
 
-        if crush or tile in (TILES['SPIKE'], TILES['SPIKE_DN']) or deadly:
-            for i in range(5):
-                draw_scene(stdscr, grid, plats, px, py, int(cx), int(cy), 60, "DEAD!", cur_t, level_num, title, i%2!=0)
+        should_die, reason = False, ""
+
+        if crush and not is_safe: should_die, reason = True, "CRUSH"
+        if tile in (TILES['SPIKE'], TILES['SPIKE_DN']): should_die, reason = True, "SPIKE"
+        if deadly: should_die, reason = True, f"PLUGIN [{tile}]"
+
+        if should_die:
+            for i in range(10): # Longer death anim to read message
+                draw_scene(stdscr, grid, plats, px, py, int(cx), int(cy), 60, f"DEAD! ({reason})", cur_t, level_num, title, i%2!=0)
                 time.sleep(0.05)
-            inp.reset()
-            curses.flushinp()
+            inp.reset(); curses.flushinp()
             for m in PLUGINS:
                 if callable(f := m.get('runtime', {}).get('on_player_death')):
-                    try: f({"grid": grid, "level": title})
+                    try: f({"grid": grid, "level": title, "meta": meta}, {})
                     except: pass
             px, py, vx, vy, ap = cp[0], cp[1] - 0.1, 0, 0, None
         elif tile == TILES['CP']:
             if (icx+0.5, icy+0.5) != cp: cp, msg, mend = (icx+0.5, icy+0.5), "CHECKPOINT", time.time() + 1.5
-        elif tile == TILES['GOAL']: return "NEXT_LEVEL", cur_t
 
         h, w = stdscr.getmaxyx()
         cx += (int(px) - w//2 - cx) * 0.1; cy += (int(py) - h//2 - cy) * 0.1
