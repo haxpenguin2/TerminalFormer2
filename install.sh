@@ -1,6 +1,3 @@
-
-
-
 #!/bin/bash
 
 # --- CONFIGURATION ---
@@ -35,7 +32,7 @@ print_banner() {
 EOF
     echo -e "${NC}"
     echo -e "${BLUE}  :: High-Performance Terminal Platformer Installer ::${NC}"
-    echo -e "${BLUE}  :: v3.2 | Menu Launch | debug-mode enabled        ::${NC}"
+    echo -e "${BLUE}  :: v3.3 | Menu Launch | debug-mode enabled        ::${NC}"
     echo ""
 }
 
@@ -162,7 +159,7 @@ Version=1.0
 Name=TerminalFormer 2
 Comment=High-performance terminal platformer
 Exec=$LAUNCHER_PATH
-Icon=utilities-terminal
+Icon=$INSTALL_DIR/icons/icon.png
 Terminal=true
 Type=Application
 Categories=Game;
