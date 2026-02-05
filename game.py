@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# game.py - TerminalFormer2 (Saved Platforms & Plugin State)
+# game.py - TerminalFormer2 (Arcade Name Entry at End)
 import curses, time, os, math, sys, json, glob, importlib.util
 from collections import deque
 
@@ -32,23 +32,30 @@ load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
 # --- scores ---
-def save_score(cat, val):
+def save_score(cat, val, name="Player"):
     data = {}
     try:
         if os.path.exists(DIRS['SCORES']):
             with open(DIRS['SCORES'], 'r') as f: data = json.load(f)
     except: pass
-    data.setdefault(cat, []).append(val)
-    data[cat] = sorted(data[cat])[:5]
+
+    entries = data.get(cat, [])
+    # Normalize legacy data
+    entries = [{"name": "UNK", "time": x} if isinstance(x, (int, float)) else x for x in entries]
+
+    entries.append({"name": name, "time": val})
+    entries.sort(key=lambda x: x["time"])
+    data[cat] = entries[:10]
+
     with open(DIRS['SCORES'], 'w') as f: json.dump(data, f)
 
 # --- slot/save helpers ---
 SAVE_SLOT_PATH = None
 RESUME_FLAG = False
+SPEEDRUN_MODE = False
 
 def save_game_state_to(path, state):
     try:
-        # We use a tmp file to prevent corruption if crash happens during write
         tmp = path + ".tmp"
         with open(tmp, "w") as f: json.dump(state, f)
         os.replace(tmp, path)
@@ -107,7 +114,7 @@ class Platform:
         self.ox,self.oy,self.w = d['x'],d['y'],d['w']
         self.lx,self.ly,self.spd = d.get('lx',0),d.get('ly',0),d.get('spd',1.0)
         self.ease = d.get('ease','SINE'); self.x,self.y,self.t = self.ox,self.oy,start_t
-        self.update(0) # Calc initial pos based on start_t
+        self.update(0)
     def update(self,dt):
         self.t += dt*self.spd
         off = math.sin(self.t) if self.ease=='SINE' else ((self.t/math.pi)%2 - 1 if (self.t/math.pi)%2>1 else 1 - (self.t/math.pi)%2)
@@ -129,7 +136,6 @@ def load_level(path, platform_timers=None):
                 meta = d; title = str(d.get("title", title)).replace('"','')
                 pdata = d.get("platforms", [])
                 for i, p in enumerate(pdata):
-                    # Load timer if available
                     t_start = platform_timers[i] if platform_timers and i < len(platform_timers) else 0.0
                     mp = Platform(p, t_start)
                     plats.append(mp)
@@ -199,7 +205,8 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle
         try: stdscr.addch(spy, spx, TILES['PLAYER'], curses.A_BOLD)
         except: pass
     try:
-        if not msg: stdscr.addstr(0,0,f"LEVEL {lnum} \"{ltitle}\"", curses.A_BOLD)
+        t_str = f"SPEEDRUN" if SPEEDRUN_MODE else f"LEVEL {lnum}"
+        if not msg: stdscr.addstr(0,0,f"{t_str} \"{ltitle}\"", curses.A_BOLD)
         else: stdscr.addstr(0,1,msg, curses.A_REVERSE | curses.A_BOLD)
         stdscr.addstr(0, w-15, f"TIME: {time:.2f}s", curses.A_BOLD)
         stdscr.addstr(h-1, 0, f"Pos: {int(px)},{int(py)} | FPS: {int(fps)}")
@@ -215,7 +222,7 @@ def draw_centered_menu(stdscr, title, opts, selected_idx):
         for y in range(by, by+box_h): stdscr.addstr(y, bx, " "*box_w)
         stdscr.attron(curses.A_BOLD | curses.A_UNDERLINE); stdscr.addstr(by, bx+2, title); stdscr.attroff(curses.A_BOLD | curses.A_UNDERLINE)
         for i,it in enumerate(opts):
-            txt = f">  {it}  <" if i==selected_idx else f"   {it}   "
+            txt = f"> {it} <" if i==selected_idx else f"   {it}   "
             attr = curses.A_REVERSE if i==selected_idx else curses.A_NORMAL
             stdscr.addstr(by+2+i, bx+2, txt, attr)
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM)
@@ -225,7 +232,10 @@ def draw_centered_menu(stdscr, title, opts, selected_idx):
 def show_in_game_menu(stdscr, allow_save=True):
     opts = ["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu", "Save Position (Slot)", "Clear Slot Data"])
-    opts.extend(["Quit to Menu (No Save)", "Cancel"])
+
+    quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"
+    opts.extend([quit_txt, "Cancel"])
+
     idx = 0; stdscr.nodelay(False)
     while True:
         draw_centered_menu(stdscr, "PAUSE MENU", opts, idx)
@@ -236,21 +246,57 @@ def show_in_game_menu(stdscr, allow_save=True):
             sel = opts[idx]; stdscr.nodelay(True)
             if sel == "Resume": return "RESUME"
             if sel == "Save & Quit to Menu": return "SAVE_QUIT"
-            if sel == "Quit to Menu (No Save)": return "QUIT_NO_SAVE"
+            if sel == quit_txt: return "QUIT_NO_SAVE"
             if sel == "Save Position (Slot)": return "SAVE_ONLY"
             if sel == "Clear Slot Data": return "CLEAR_SLOT"
             return "CANCEL"
         elif k in (ord('m'), ord('M'), ord('q'), ord('Q')):
             stdscr.nodelay(True); return "RESUME"
 
+# --- ARCADE NAME ENTRY ---
+def arcade_name_entry(stdscr, total_time):
+    stdscr.nodelay(False)
+    name = ""
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        cy, cx = h // 2, w // 2
+
+        # Title
+        title = "★ CONGRATULATIONS! ★"
+        stdscr.addstr(cy - 5, cx - len(title)//2, title, curses.A_BOLD)
+
+        time_str = f"FINAL TIME: {total_time:.2f}s"
+        stdscr.addstr(cy - 3, cx - len(time_str)//2, time_str)
+
+        # Name Input
+        prompt = "ENTER INITIALS:"
+        stdscr.addstr(cy - 1, cx - len(prompt)//2, prompt, curses.A_UNDERLINE)
+
+        # Blinking cursor simulation
+        field_disp = f" {name} "
+        if (int(time.time() * 2) % 2) == 0: field_disp += "█"
+        else: field_disp += " "
+
+        stdscr.addstr(cy + 1, cx - len(field_disp)//2, field_disp, curses.A_REVERSE)
+        stdscr.addstr(cy + 3, cx - 13, "TYPE NAME - ENTER TO SUBMIT", curses.A_DIM)
+
+        stdscr.refresh()
+
+        k = stdscr.getch()
+        if k in (10, 13): # Enter
+            return name if len(name) > 0 else "AAA"
+        elif k in (curses.KEY_BACKSPACE, 127, 8):
+            name = name[:-1]
+        elif 32 <= k <= 126 and len(name) < 10:
+            name += chr(k).upper()
+
 # --- GAME LOOP ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
 
-    # Extract Platform Timers & Plugin State from resume data
     p_timers = []
     plugin_data = {}
-
     if resume_state:
          p_timers = resume_state.get("platform_timers", [])
          plugin_data = resume_state.get("plugin_state", {})
@@ -270,10 +316,8 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 
     vx,vy,cp = 0.0, 0.0, start_cp
 
-    # APPLY RESUME DATA IF VALID
     if resume_state:
         try:
-            # We allow approximate matches (filename only) or exact paths
             saved_f = resume_state.get("level_file", "")
             if saved_f and (os.path.basename(saved_f) == os.path.basename(level_file)):
                 r_px, r_py = float(resume_state.get("px", -1)), float(resume_state.get("py", -1))
@@ -444,6 +488,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     try: f({"grid":grid, "level":title, "meta":meta}, plugin_data)
                     except: pass
             px,py,vx,vy,ap = cp[0], cp[1]-0.1, 0, 0, None
+
         elif tile == TILES['CP']:
             if (icx+0.5, icy+0.5) != cp: cp, msg, mend = (icx+0.5, icy+0.5), "CHECKPOINT", time.time() + 1.5
 
@@ -458,7 +503,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 
 # --- MAIN ---
 def main(stdscr):
-    global SAVE_SLOT_PATH, RESUME_FLAG
+    global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
     curses.curs_set(0); inp = InputEngine()
     mode, path, tot_t, lvl = "CAMP", "", 0.0, 1
     resume_state = None
@@ -471,22 +516,26 @@ def main(stdscr):
             SAVE_SLOT_PATH = args[i+1]; i += 2
         elif a == "--resume":
             RESUME_FLAG = True; i += 1
+        elif a == "--speedrun":
+            SPEEDRUN_MODE = True; i += 1
         else:
             mode, path = "SNGL", a; i += 1
 
-    # INITIAL LOAD IF RESUMING
     if RESUME_FLAG and SAVE_SLOT_PATH:
         resume_state = load_saved_game_from(SAVE_SLOT_PATH)
         if resume_state:
-            # Override level number and time from save
-            if "level_num" in resume_state: lvl = int(resume_state["level_num"])
-            if "tot_time" in resume_state: tot_t = float(resume_state["tot_time"])
+            saved_lvl = int(resume_state.get("level_num", 1))
+            check_path = os.path.join(DIRS['CAMP'], f"level{saved_lvl}.txt")
+            if resume_state.get("completed", False) or not os.path.exists(check_path):
+                resume_state = None
+                lvl = 1; tot_t = 0.0
+            else:
+                lvl = saved_lvl
+                if "tot_time" in resume_state: tot_t = float(resume_state["tot_time"])
 
     try:
         while True:
-            # Determine File Path
             if mode == "CAMP":
-                # Check if resume_state has a file path, otherwise build standard
                 if resume_state and "level_file" in resume_state:
                     fpath = resume_state["level_file"]
                 else:
@@ -495,19 +544,29 @@ def main(stdscr):
                 fpath = path if os.path.exists(path) else os.path.join(DIRS['LEVELS'], path)
 
             if not os.path.exists(fpath):
+                # CAMPAIGN/SPEEDRUN END CONDITION
                 if mode == "CAMP" and lvl > 1:
-                    save_score("campaign", tot_t)
-                    # Clear slot on completion so user can restart
-                    if SAVE_SLOT_PATH: clear_slot(SAVE_SLOT_PATH)
-                    stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-30)//2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD)
+                    if SAVE_SLOT_PATH:
+                        if SPEEDRUN_MODE: clear_slot(SAVE_SLOT_PATH)
+                        else: save_game_state_to(SAVE_SLOT_PATH, {"level_num": 1, "completed": True})
+
+                    # ASK FOR NAME IF SPEEDRUN MODE, ELSE AUTO-SAVE
+                    if SPEEDRUN_MODE:
+                        player_name = arcade_name_entry(stdscr, tot_t)
+                        save_score("speedrun_camp", tot_t, player_name)
+                    else:
+                        save_score("campaign", tot_t, "Player")
+
+                    stdscr.erase()
+                    stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD)
                     stdscr.refresh(); time.sleep(3)
-                elif mode == "CAMP": stdscr.addstr(0,0,"Error: No Campaign Levels"); stdscr.refresh(); time.sleep(2)
+
+                elif mode == "CAMP":
+                    stdscr.addstr(0,0,"Error: No Campaign Levels"); stdscr.refresh(); time.sleep(2)
                 return
 
-            # Play Level
-            res, el = play_level(stdscr, fpath, inp, lvl, tot_t, resume_state=resume_state, allow_save=(mode=="CAMP"))
-
-            # Consume resume state so next level doesn't use it
+            can_save_in_menu = (mode=="CAMP" and not SPEEDRUN_MODE)
+            res, el = play_level(stdscr, fpath, inp, lvl, tot_t, resume_state=resume_state, allow_save=can_save_in_menu)
             resume_state = None
 
             if res == "QUIT": return
@@ -520,25 +579,28 @@ def main(stdscr):
                     time.sleep(0.05)
 
                 if mode == "SNGL":
-                    save_score(os.path.basename(fpath), el)
+                    # Also ask for name on single level speedrun
+                    if SPEEDRUN_MODE:
+                        player_name = arcade_name_entry(stdscr, el)
+                        save_score(f"speedrun_{os.path.basename(fpath)}", el, player_name)
+                    else:
+                        save_score(os.path.basename(fpath), el, "Player")
+                    return
 
                 tot_t += el
                 lvl += 1
 
-                # --- AUTO-SAVE PROGRESS ---
-                if mode == "CAMP" and SAVE_SLOT_PATH:
+                if mode == "CAMP" and SAVE_SLOT_PATH and not SPEEDRUN_MODE:
                     next_file = os.path.join(DIRS['CAMP'], f"level{lvl}.txt")
-                    # Save state for start of next level (plugins and platforms reset for new level, so don't save them here)
                     save = {
                         "level_file": os.path.abspath(next_file),
                         "level_num": lvl,
                         "tot_time": tot_t,
                         "px": -1, "py": -1, "vx": 0, "vy": 0,
-                        "platform_timers": [], # Reset
-                        "plugin_state": {} # Reset
+                        "platform_timers": [],
+                        "plugin_state": {}
                     }
                     save_game_state_to(SAVE_SLOT_PATH, save)
-                # --------------------------
 
     except KeyboardInterrupt: pass
     finally: inp.stop()

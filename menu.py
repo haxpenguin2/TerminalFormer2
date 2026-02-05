@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# menu.py - Optimized: Synced Preview, Dim Player, Platform Attachment
+# menu.py - Fixed High Scores (Shows all levels)
 import curses, os, sys, json, subprocess, random, time, math, re
 
 # --- CONFIG ---
@@ -54,13 +54,8 @@ def load_level(path, platform_timers=None):
                 pdata = meta if isinstance(meta, list) else meta.get('platforms', [])
                 title = str(meta.get('title', title)).replace('"','') if isinstance(meta, dict) else title
                 for i, p in enumerate(pdata):
-                    # Restore saved timer if available, else 0
                     t_start = platform_timers[i] if platform_timers and i < len(platform_timers) else 0.0
                     mp = MovingPlatform(p, t_start); plats.append(mp)
-
-                    # --- FIX IS HERE ---
-                    # Clear grid under platform using ORIGINAL coordinates (xo, yo)
-                    # Because mp.x/mp.y might have already moved due to the timer
                     for k in range(mp.w):
                         gy, gx = int(mp.yo), int(mp.xo)+k
                         if 0<=gy<len(grid) and 0<=gx<len(grid[0]): grid[gy][gx] = ' '
@@ -84,9 +79,11 @@ def load_json(path):
     except: return {}
 
 # --- ACTIONS ---
-def launch(slot=None, resume=False, path=None):
+def launch(slot=None, resume=False, path=None, speedrun=False):
     curses.endwin()
-    cmd = [sys.executable, "game.py"] + ([path] if path else []) + (["--slot", slot] if slot else []) + (["--resume"] if resume else [])
+    cmd = [sys.executable, "game.py"] + ([path] if path else []) + (["--slot", slot] if slot else [])
+    if resume: cmd.append("--resume")
+    if speedrun: cmd.append("--speedrun")
     subprocess.run(cmd)
 
 def text_input(stdscr, p):
@@ -102,8 +99,6 @@ def draw_bg_frame(stdscr, data, cx, cy):
     grid, plats = data[0], data[1]
     h, w = stdscr.getmaxyx(); gh, gw = len(grid), len(grid[0])
     stdscr.attron(curses.A_DIM)
-
-    # Draw Static Grid
     for y in range(h):
         row = grid[int(y + cy) % gh]; sx = int(cx) % gw; cur_x = sx; d_len = 0; buf = ""
         while d_len < w:
@@ -112,8 +107,6 @@ def draw_bg_frame(stdscr, data, cx, cy):
             d_len += chk; cur_x = 0
         try: stdscr.addstr(y, 0, buf)
         except: pass
-
-    # Draw Platforms
     ox, oy = -int(cx % gw), -int(cy % gh)
     for p in plats:
         py = oy
@@ -132,42 +125,26 @@ def draw_menu(stdscr, data, cx, cy, title, items, sel):
     stdscr.erase(); h, w = stdscr.getmaxyx()
     lvl = data if len(data) < 4 else data[:3]
     draw_bg_frame(stdscr, lvl, cx, cy)
-
-    # Draw Player Preview (Synced with Scroll & Platforms)
     if len(data) == 4 and lvl[0]:
         gh, gw = len(lvl[0]), len(lvl[0][0])
-        # data[3] structure: (px, py, attached_plat_idx, rel_x, rel_y)
         p_info = data[3]
         raw_px, raw_py = p_info[0], p_info[1]
-
-        # Calculate Current Position
         cur_px, cur_py = raw_px, raw_py
         if len(p_info) == 5 and p_info[2] is not None:
-            # Player is attached to a platform, move with it
             plat = lvl[1][p_info[2]]
             cur_px = plat.x + p_info[3]
             cur_py = plat.y + p_info[4]
-
-        # Screen relative position
-        scr_x = int(cur_px - cx) % gw
-        scr_y = int(cur_py - cy) % gh
-
-        # Draw Player Dimmed
-        if 0 <= scr_y < h and 0 <= scr_x < w:
-            stdscr.addch(scr_y, scr_x, '#', curses.A_DIM)
-
+        scr_x = int(cur_px - cx) % gw; scr_y = int(cur_py - cy) % gh
+        if 0 <= scr_y < h and 0 <= scr_x < w: stdscr.addch(scr_y, scr_x, '#', curses.A_DIM)
     vis_h = min(len(items), max(1, (h-6)//2)) * 2
     sy = max(4, (h//2) - (vis_h//2))
     win_sz = max(1, (h-6)//2); top = max(0, min(sel - win_sz//2, len(items) - win_sz))
-
     draw_center(stdscr, max(0, sy-3), title, curses.A_BOLD | curses.A_UNDERLINE)
     if top > 0: draw_center(stdscr, sy-1, "^", curses.A_DIM)
-
     for i in range(top, min(len(items), top + win_sz)):
         lbl = items[i]; y = sy + (i - top)*2
         if i == sel: draw_center(stdscr, y, f"> {lbl} <", curses.A_BOLD)
         else: draw_center(stdscr, y, f"   {lbl}   ")
-
     if top + win_sz < len(items): draw_center(stdscr, sy + (min(len(items), top+win_sz)-top)*2, "v", curses.A_DIM)
     draw_center(stdscr, h-2, "UP/DOWN: Navigate  |  ENTER: Select  |  Q: Back/Quit", curses.A_DIM)
     stdscr.refresh()
@@ -178,9 +155,7 @@ def run_loop(stdscr, bg, title, items, datas):
     while True:
         cx += BG_SPD[0]; cy += BG_SPD[1]
         active = datas[sel] if datas and datas[sel] else bg
-        # Update bg platforms and active item platforms
         for obj in (bg[1] + (active[1] if active!=bg and active else [])): obj.update(0.05)
-
         draw_menu(stdscr, active, cx, cy, title, items, sel)
         k = stdscr.getch()
         if k == curses.KEY_UP: sel = (sel - 1) % len(items)
@@ -194,14 +169,41 @@ def show_scores(stdscr, bg, cx, cy):
         cx += BG_SPD[0]; cy += BG_SPD[1]; [p.update(0.05) for p in bg[1]]
         stdscr.erase(); draw_bg_frame(stdscr, bg, cx, cy)
         sc = load_json(SCORES_FILE); h = stdscr.getmaxyx()[0]
-        draw_center(stdscr, 3, "--- HIGH SCORES ---", curses.A_BOLD | curses.A_UNDERLINE)
-        r = 6; draw_center(stdscr, r, "CAMPAIGN:", curses.A_BOLD)
-        for i, t in enumerate(sc.get("campaign", [])): draw_center(stdscr, r+1+i, f"{i+1}. {t:.2f}s")
-        if "campaign" not in sc: draw_center(stdscr, r+1, "No runs yet.")
-        r += len(sc.get("campaign", [])) + 3; draw_center(stdscr, r, "CUSTOM LEVELS:", curses.A_BOLD)
-        for i, k in enumerate(sorted([k for k in sc if k!="campaign"])):
-            if r+1+i >= h-4: break
-            draw_center(stdscr, r+1+i, f"{k}: {sc[k][0]:.2f}s")
+        draw_center(stdscr, 3, "--- SPEEDRUN RECORDS ---", curses.A_BOLD | curses.A_UNDERLINE)
+
+        # 1. CAMPAIGN (Speedrun Only)
+        r = 6; draw_center(stdscr, r, "CAMPAIGN (Speedrun Mode):", curses.A_BOLD)
+        camp_scores = sc.get("speedrun_camp", []) # Specifically get speedrun_camp
+        camp_scores = [s if isinstance(s, dict) else {"name":"UNK", "time":s} for s in camp_scores]
+
+        for i, t in enumerate(camp_scores[:10]):
+            draw_center(stdscr, r+1+i, f"{i+1}. {t.get('name','AAA')} - {t.get('time',0):.2f}s")
+        if not camp_scores: draw_center(stdscr, r+1, "No validated speedruns.")
+
+        # 2. INDIVIDUAL LEVELS (Normal & Speedrun)
+        r += len(camp_scores[:10]) + 3; draw_center(stdscr, r, "LEVEL RECORDS:", curses.A_BOLD)
+
+        # Filter: Exclude campaign main keys, allow everything else (level1.txt, speedrun_level1.txt)
+        custom_keys = sorted([k for k in sc if k not in ("campaign", "speedrun_camp")])
+
+        count = 0
+        for i, k in enumerate(custom_keys):
+            if r+1+count >= h-4: break
+            level_scores = sc[k]
+            if level_scores:
+                best = level_scores[0]
+                # Nice formatting
+                if k.startswith("speedrun_"):
+                    disp_name = k.replace("speedrun_", "") + " (Speedrun)"
+                else:
+                    disp_name = k
+
+                if isinstance(best, dict):
+                    draw_center(stdscr, r+1+count, f"{disp_name}: {best['name']} - {best['time']:.2f}s")
+                else:
+                    draw_center(stdscr, r+1+count, f"{disp_name}: {best:.2f}s")
+                count += 1
+
         draw_center(stdscr, h-3, "Press ANY KEY to return", curses.A_BOLD)
         stdscr.refresh(); time.sleep(0.03)
 
@@ -224,29 +226,33 @@ def menu_editor(stdscr, bg):
             if n != ".txt": curses.endwin(); subprocess.run([sys.executable, "editor.py", n])
         elif i <= len(fs): curses.endwin(); subprocess.run([sys.executable, "editor.py", fs[i-1]])
 
+def menu_speedrun(stdscr, bg):
+    # Instant start!
+    temp_path = os.path.join(DIRS["sav"], "speedrun_temp.json")
+    json.dump({}, open(temp_path, 'w'))
+    launch(slot=temp_path, speedrun=True)
+    if os.path.exists(temp_path):
+        try: os.remove(temp_path)
+        except: pass
+
 def menu_slots(stdscr, bg):
     while True:
         sl = get_slots()
         def get_prev(p):
-            d = load_json(p); lf = d.get("level_file")
+            d = load_json(p)
+            if d.get("campaign_complete", False) or d.get("completed", False):
+                d = {}; json.dump({}, open(p, 'w'))
+
+            lf = d.get("level_file")
             if lf and os.path.exists(lf):
-                # Load level with saved platform timers
                 p_timers = d.get("platform_timers", [])
                 lvl_data = load_level(lf, p_timers)
                 px, py = d.get("px", 0), d.get("py", 0)
-
-                # Check Attachment: Is player on a moving platform?
                 att_idx, rel_x, rel_y = None, 0, 0
                 for i, plat in enumerate(lvl_data[1]):
-                    # Check overlap (plat y matches player y+1, x within range)
-                    # Use rounded positions for logic
                     pl_y, pl_x = int(plat.y), int(plat.x)
                     if int(py) == pl_y - 1 and pl_x <= int(px) < pl_x + plat.w:
-                        att_idx = i
-                        rel_x = px - plat.x
-                        rel_y = py - plat.y
-                        break
-
+                        att_idx = i; rel_x = px - plat.x; rel_y = py - plat.y; break
                 return (lvl_data[0], lvl_data[1], lvl_data[2], (px, py, att_idx, rel_x, rel_y))
             return bg
 
@@ -269,8 +275,11 @@ def menu_slots(stdscr, bg):
 def main(stdscr):
     curses.curs_set(0); ensure_dirs(); load_plugins()
     bg = get_bg(); cx = cy = 0
-    ops = [("PLAY CAMPAIGN", lambda: menu_slots(stdscr, bg)), ("CUSTOM LEVELS", lambda: menu_custom(stdscr, bg)),
-           ("LEVEL EDITOR", lambda: menu_editor(stdscr, bg)), ("HIGH SCORES", lambda: show_scores(stdscr, bg, cx, cy)),
+    ops = [("PLAY CAMPAIGN", lambda: menu_slots(stdscr, bg)),
+           ("SPEEDRUN MODE", lambda: menu_speedrun(stdscr, bg)),
+           ("CUSTOM LEVELS", lambda: menu_custom(stdscr, bg)),
+           ("LEVEL EDITOR", lambda: menu_editor(stdscr, bg)),
+           ("HIGH SCORES", lambda: show_scores(stdscr, bg, cx, cy)),
            ("QUIT GAME", lambda: sys.exit(0))]
     while True:
         l, i = run_loop(stdscr, bg, "TerminalFormer2", [o[0] for o in ops], [bg]*len(ops))
