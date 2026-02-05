@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# game.py - TerminalFormer2 (Arcade Name Entry at End) - Fixed input (evdev/termios/curses) + pause menu
+# game.py - TerminalFormer2 (Arcade Name Entry at End)
+# Evdev wrapper-first (exact old behavior) -> native evdev -> termios -> curses
 import curses, time, os, math, sys, json, glob, importlib.util, select
 from collections import deque
 
@@ -14,7 +15,7 @@ PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
 # --- plugin loader ---
 REGISTRY, PLUGINS = {}, []
 def load_plugins():
-    if not os.path.exists(DIRS['PLUGINS']): os.makedirs(DIRS['PLUGINS'], exist_ok=True)
+    os.makedirs(DIRS['PLUGINS'], exist_ok=True)
     for path in glob.glob(os.path.join(DIRS['PLUGINS'], "*.py")):
         try:
             name = os.path.splitext(os.path.basename(path))[0]
@@ -29,7 +30,6 @@ def load_plugins():
                     if isinstance(ch, str) and len(ch) == 1: REGISTRY[ch] = m
         except Exception:
             pass
-
 load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
@@ -40,335 +40,247 @@ def save_score(cat, val, name="Player"):
         if os.path.exists(DIRS['SCORES']):
             with open(DIRS['SCORES'], 'r') as f: data = json.load(f)
     except: pass
-
     entries = data.get(cat, [])
-    # Normalize legacy data
     entries = [{"name": "UNK", "time": x} if isinstance(x, (int, float)) else x for x in entries]
-
     entries.append({"name": name, "time": val})
     entries.sort(key=lambda x: x["time"])
     data[cat] = entries[:10]
-
     with open(DIRS['SCORES'], 'w') as f: json.dump(data, f)
 
-# --- slot/save helpers ---
-SAVE_SLOT_PATH = None
-RESUME_FLAG = False
-SPEEDRUN_MODE = False
-
+# --- save slot helpers ---
+SAVE_SLOT_PATH = None; RESUME_FLAG = False; SPEEDRUN_MODE = False
 def save_game_state_to(path, state):
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f: json.dump(state, f)
         os.replace(tmp, path)
-    except Exception:
-        pass
-
+    except: pass
 def load_saved_game_from(path):
     try:
         if path and os.path.exists(path):
             with open(path, "r") as f: return json.load(f)
-    except Exception:
-        pass
+    except: pass
     return None
-
 def clear_slot(path):
     try:
         if path and os.path.exists(path): os.remove(path)
-    except:
-        pass
+    except: pass
 
-# --- Input engine: native evdev -> evdev_input wrapper -> termios fallback -> curses fallback ---
-# The InputEngine exposes:
-#   update(stdscr)    # to collect events (stdscr passed so we can still call getch())
-#   was(k)            # True if k was pressed since last clear
-#   down(k)           # True if key currently held
-#   clear() / reset() # clear pressed set (reset resets held state)
-#   stop()            # clean up devices / termios state
-#
-# Tokens used in code: 'LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU'
+# --- Replace the InputEngine class in your game.py with this class ---
 class InputEngine:
-    def __init__(self, prefer_evdev_env=True):
-        # states
+    """Robust input engine: wrapper -> native evdev -> termios -> curses fallback.
+    Keeps exact token mapping so LEFT/RIGHT won't be swapped.
+    """
+    def __init__(self, honor_env=True, hold_timeout=0.14):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
         self.pressed = set()
-        self.evdev_state = {k: False for k in self.keys}
+        self.ev_state = {k: False for k in self.keys}
+        self._last_seen = {}
+        self._hold_timeout = float(hold_timeout)
 
-        # Decide which low-level input to use:
-        # prefer_evdev_env: read TF2_PREFER_EVDEV env var if True
-        prefer_env = os.environ.get("TF2_PREFER_EVDEV")
-        if prefer_evdev_env and prefer_env is not None:
-            self.prefer_evdev = (prefer_env == "1")
-        else:
-            self.prefer_evdev = True
+        # honor TF2_PREFER_EVDEV env var if present
+        env = os.environ.get("TF2_PREFER_EVDEV")
+        self.prefer_evdev = True if env is None else (env == "1") if honor_env else True
 
-        # Try native evdev first (preferred), else try user's evdev_input.py wrapper, else termios
-        self.native_evdev = False
-        self.wrapper_evdev = False
-        self.termios_mode = False
-        self.termios_saved = None
-        self.stdin_fd = None
-        self.evdev_devices = {}
-        self.evdev_fd_map = {}
+        # try wrapper module first (preserve old behavior exactly)
         self.wrapper = None
-
-        # Attempt native evdev
-        try:
-            from evdev import InputDevice, list_devices, ecodes
-            self._ev_native = True
-            self._ev = (InputDevice, list_devices, ecodes)
-        except Exception:
-            self._ev_native = False
-
-        # Attempt wrapper evdev_input
         try:
             import evdev_input as evw
-            self._ev_wrapper = evw
+            self.wrapper = evw.EvdevInput()
         except Exception:
-            self._ev_wrapper = None
+            self.wrapper = None
 
-        # If prefer native and available use native; else try wrapper
-        if self.prefer_evdev and self._ev_native:
+        # native evdev fallback (if wrapper missing and available)
+        self.native_map = {}
+        self.native_fd_map = {}
+        if self.wrapper is None and self.prefer_evdev:
             try:
-                InputDevice, list_devices, ecodes = self._ev
-                self.native_init(InputDevice, list_devices, ecodes)
-                self.native_evdev = True
+                from evdev import InputDevice, list_devices, ecodes
+                CODE_TO_TOKEN = {
+                    ecodes.KEY_LEFT: 'LEFT', ecodes.KEY_RIGHT: 'RIGHT',
+                    ecodes.KEY_UP: 'UP', ecodes.KEY_DOWN: 'DOWN',
+                    ecodes.KEY_Z: 'Z', ecodes.KEY_SPACE: 'SPACE',
+                    ecodes.KEY_R: 'R', ecodes.KEY_Q: 'Q',
+                    ecodes.KEY_A: 'A', ecodes.KEY_D: 'D', ecodes.KEY_H: 'H',
+                    ecodes.KEY_ENTER: 'CONTINUE', getattr(ecodes, 'KEY_M', None): 'M'
+                }
+                CODE_TO_TOKEN = {k:v for k,v in CODE_TO_TOKEN.items() if k is not None}
+                devs = []
+                for p in list_devices():
+                    try:
+                        d = InputDevice(p)
+                        caps = d.capabilities()
+                        if hasattr(caps, '__contains__') and ecodes.EV_KEY in caps:
+                            devs.append(d)
+                    except Exception:
+                        pass
+                self.native_fd_map = {d.fd: d for d in devs}
+                self.native_map = CODE_TO_TOKEN
             except Exception:
-                self.native_evdev = False
+                self.native_fd_map = {}
+                self.native_map = {}
 
-        if not self.native_evdev and self._ev_wrapper:
-            try:
-                # wrapper expected to be class EvdevInput with poll(timeout) and devices list
-                self.wrapper = self._ev_wrapper.EvdevInput()
-                self.wrapper_evdev = True
-            except Exception:
-                self.wrapper_evdev = False
-
-        # If neither evdev method is available, try to set up termios fallback
-        if not (self.native_evdev or self.wrapper_evdev):
+        # termios fallback if neither wrapper nor native present
+        self.term_mode = False; self.stdin_fd = None; self._term_saved = None
+        if not self.wrapper and not self.native_fd_map:
             try:
                 import tty, termios
-                self.termios_mode = True
                 self.stdin_fd = sys.stdin.fileno()
-                self.termios_saved = termios.tcgetattr(self.stdin_fd)
-                tty.setcbreak(self.stdin_fd)  # non-canonical, but still echoes — ok for gameplay
+                self._term_saved = termios.tcgetattr(self.stdin_fd)
+                tty.setcbreak(self.stdin_fd)
+                self.term_mode = True
             except Exception:
-                self.termios_mode = False
-                self.stdin_fd = None
+                self.term_mode = False
 
-        # curses fallback: we still call stdscr.getch() in update() to ensure menu keys work
-        # Map evdev codes/tokens to game tokens:
-        self._code_map = {
-            # tokens returned by evdev wrappers / native mapping (strings) -> game token
-            'LEFT': 'LEFT', 'RIGHT': 'RIGHT', 'UP': 'JUMP', 'DOWN': 'DOWN',
-            'SPACE': 'JUMP', 'ENTER': 'CONTINUE', 'CONTINUE': 'CONTINUE',
-            'R': 'RESET', 'Q': 'QUIT', 'M': 'MENU',
-            # older wrapper might use letters:
-            'A': 'LEFT', 'D': 'RIGHT', 'Z': 'JUMP', 'H': 'LEFT'
-        }
+        # canonical map: tokens we accept -> game tokens
+        self.token_map = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
+                          'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','Z':'JUMP','H':'LEFT'}
 
-        # if native we have ecodes for direct mapping, store here; we'll build native_map if native_init succeeded
-        self.native_map = {}  # ecodes.KEY_* -> token string (LEFT, RIGHT, M, etc.)
-
-    def native_init(self, InputDevice, list_devices, ecodes):
-        # Build a native mapping for common keys, including KEY_M
-        CODE_TO_TOKEN = {
-            ecodes.KEY_LEFT: 'LEFT',
-            ecodes.KEY_RIGHT: 'RIGHT',
-            ecodes.KEY_UP: 'UP',
-            ecodes.KEY_DOWN: 'DOWN',
-            ecodes.KEY_Z: 'SPACE',
-            ecodes.KEY_SPACE: 'SPACE',
-            ecodes.KEY_R: 'R',
-            ecodes.KEY_Q: 'Q',
-            ecodes.KEY_A: 'A',
-            ecodes.KEY_D: 'D',
-            ecodes.KEY_H: 'H',
-            ecodes.KEY_ENTER: 'CONTINUE',
-            # Add KEY_M explicitly so 'm' becomes MENU
-            getattr(ecodes, 'KEY_M', None): 'M'
-        }
-        # Remove None keys if KEY_M missing in ecodes
-        CODE_TO_TOKEN = {k:v for k,v in CODE_TO_TOKEN.items() if k is not None}
-
-        # open devices that have EV_KEY capability
-        devs = []
-        for path in list_devices():
-            try:
-                d = InputDevice(path)
-                caps = d.capabilities()
-                if hasattr(caps, 'keys') or ecodes.EV_KEY in caps:
-                    devs.append(d)
-            except Exception:
-                continue
-        self.evdev_devices = devs
-        self.evdev_fd_map = {d.fd: d for d in devs}
-        self.native_map = CODE_TO_TOKEN
-
-    def poll_native(self, timeout=0.0):
-        # returns list of (token_str, value) where value: 1=down,0=up,2=repeat
-        if not self.evdev_fd_map:
+    def _poll_native(self, timeout=0.0):
+        if not self.native_fd_map: return []
+        try:
+            r,_,_ = select.select(list(self.native_fd_map.keys()), [], [], timeout)
+        except Exception:
             return []
-        r, _, _ = select.select(list(self.evdev_fd_map.keys()), [], [], timeout)
-        events = []
+        out = []
         for fd in r:
-            dev = self.evdev_fd_map.get(fd)
-            if not dev: continue
+            d = self.native_fd_map.get(fd)
+            if not d: continue
             try:
-                for ev in dev.read():
-                    # event structure has .type .code .value
+                for ev in d.read():
                     if ev.type == 1:  # EV_KEY
                         token = self.native_map.get(ev.code)
                         if token:
-                            events.append((token, ev.value))
-            except BlockingIOError:
+                            out.append((token, int(ev.value)))
+            except (BlockingIOError, InterruptedError):
                 continue
             except Exception:
                 continue
-        return events
+        return out
 
-    def poll_wrapper(self, timeout=0.0):
-        # wrapper expected to have .poll(timeout)
+    def _poll_wrapper(self, timeout=0.0):
         try:
-            if self.wrapper:
-                return self.wrapper.poll(timeout)
+            if self.wrapper: return self.wrapper.poll(timeout)
         except Exception:
             pass
         return []
 
-    def poll_term(self, timeout=0.0):
-        # read stdin using select, parse escape sequences for arrows
+    def _poll_term(self, timeout=0.0):
         if self.stdin_fd is None: return []
-        r, _, _ = select.select([self.stdin_fd], [], [], timeout)
-        events = []
-        if not r: return events
         try:
-            data = os.read(self.stdin_fd, 32)
-            if not data: return events
-            s = data.decode(errors='ignore')
-            i = 0
-            while i < len(s):
-                ch = s[i]
-                if ch == '\x1b':  # possible escape seq
-                    # try to read a bracketed seq
-                    if i+2 < len(s) and s[i+1] == '[':
-                        code = s[i+2]
-                        if code == 'A': events.append(('UP', 1))
-                        elif code == 'B': events.append(('DOWN', 1))
-                        elif code == 'C': events.append(('RIGHT', 1))
-                        elif code == 'D': events.append(('LEFT', 1))
-                        i += 3
-                        continue
-                else:
-                    # map keys
-                    if ch == ' ':
-                        events.append(('SPACE', 1))
-                    else:
-                        upch = ch.upper()
-                        if upch == 'R': events.append(('R', 1))
-                        elif upch == 'Q': events.append(('Q', 1))
-                        elif upch == 'M': events.append(('M', 1))
-                        elif upch == '\r' or upch == '\n': events.append(('CONTINUE', 1))
-                        elif upch == 'Z' or upch == 'W' or upch == 'K': events.append(('SPACE', 1))
-                        elif upch == 'A': events.append(('A', 1))
-                        elif upch == 'D': events.append(('D', 1))
-                    i += 1
-                    continue
-                i += 1
+            r,_,_ = select.select([self.stdin_fd], [], [], timeout)
         except Exception:
-            pass
-        return events
+            return []
+        if not r: return []
+        try:
+            data = os.read(self.stdin_fd, 64).decode(errors='ignore')
+        except Exception:
+            try: data = sys.stdin.read(1)
+            except Exception: return []
+        out = []
+        i=0
+        while i < len(data):
+            ch = data[i]
+            if ch == '\x1b' and i+2 < len(data) and data[i+1]=='[':
+                code = data[i+2]; i += 3
+                if code == 'A': out.append(('UP',1))
+                elif code == 'B': out.append(('DOWN',1))
+                elif code == 'C': out.append(('RIGHT',1))
+                elif code == 'D': out.append(('LEFT',1))
+                continue
+            up = ch.upper()
+            if up == ' ': out.append(('SPACE',1))
+            elif up in ('\r','\n'): out.append(('CONTINUE',1))
+            elif up == 'R': out.append(('R',1))
+            elif up == 'Q': out.append(('Q',1))
+            elif up == 'M': out.append(('M',1))
+            elif up in ('Z','W'): out.append(('Z',1))
+            elif up == 'A': out.append(('A',1))
+            elif up == 'D': out.append(('D',1))
+            i += 1
+        # update last_seen timestamps to emulate hold behavior
+        now = time.time()
+        for t,_ in out:
+            mapped = self.token_map.get(t, t)
+            if mapped: self._last_seen[mapped] = now
+        return out
 
     def update(self, stdscr):
-        # read from chosen low-level source(s)
-        ev_tokens = []
-        # prefer native if enabled
-        if self.native_evdev:
-            ev_tokens += self.poll_native(0.0)
-        elif self.wrapper_evdev:
-            ev_tokens += self.poll_wrapper(0.0)
-        elif self.termios_mode:
-            ev_tokens += self.poll_term(0.0)
+        evs = []
+        # wrapper preferred (preserve exact behavior)
+        if self.wrapper:
+            evs += self._poll_wrapper(0.0)
+        elif self.native_fd_map:
+            evs += self._poll_native(0.0)
+        elif self.term_mode:
+            evs += self._poll_term(0.0)
 
-        # convert ev tokens to game tokens and update pressed/held state
-        for t, v in ev_tokens:
-            # t may be like 'LEFT' or 'SPACE' or 'A' (from wrapper/native mapping)
-            mapped = self._code_map.get(t, None)
-            if not mapped:
-                # if the wrapper returned letter tokens that our map didn't include, try upper
-                mapped = self._code_map.get(str(t).upper(), None)
-            if not mapped:
-                # If still not mapped, ignore
-                continue
-            if v == 1:  # press down
-                self.pressed.add(mapped); self.evdev_state[mapped] = True
-            elif v == 0:  # release
-                self.evdev_state[mapped] = False
-            elif v == 2:  # repeat (treat as down)
-                self.pressed.add(mapped); self.evdev_state[mapped] = True
+        now = time.time()
+        # map & apply events
+        for t, v in evs:
+            mapped = self.token_map.get(t) or self.token_map.get(str(t).upper())
+            if not mapped: continue
+            if v == 1:
+                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
+            elif v == 0:
+                self.ev_state[mapped] = False
+                if mapped in self._last_seen: del self._last_seen[mapped]
+            elif v == 2:
+                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
 
-        # ALSO read curses key(s) so M works when curses input is available
+        # termios: decay holds that haven't been seen recently (simulate key-up)
+        if self.term_mode:
+            cutoff = now - self._hold_timeout
+            stale = [k for k,t in self._last_seen.items() if t < cutoff]
+            for k in stale:
+                self.ev_state[k] = False
+                del self._last_seen[k]
+
+        # also read curses keys (menu fallback)
         curses_keys = {k: False for k in self.keys}
         try:
-            # read all pending chars
             while True:
                 k = stdscr.getch()
                 if k == -1: break
                 n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
-                     ord('r'):'RESET', ord('R'):'RESET',
-                     ord('q'):'QUIT', ord('Q'):'QUIT',
-                     ord('m'):'MENU', ord('M'):'MENU',
-                     ord('\n'):'CONTINUE', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
+                     ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
+                     ord('m'):'MENU', ord('M'):'MENU', ord('\n'):'CONTINUE', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
                 if n:
                     curses_keys[n] = True
                     self.pressed.add(n)
-                    # treat space/jump as continue too for menu selects
-                    if n == 'JUMP': curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
+                    if n == 'JUMP':
+                        curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
         except Exception:
             pass
 
-        # finalize combined state
         for k in self.keys:
-            self.keys[k] = self.evdev_state.get(k, False) or curses_keys.get(k, False)
+            self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
 
+    def was(self, k): return k in self.pressed
+    def down(self, k): return bool(self.keys.get(k, False))
+    def clear(self): self.pressed.clear()
     def reset(self):
-        for k in self.keys: self.keys[k] = False; self.evdev_state[k] = False
-        self.pressed.clear()
-
-    def was(self, k):
-        return k in self.pressed
-
-    def down(self, k):
-        return bool(self.keys.get(k, False))
-
-    def clear(self):
-        self.pressed.clear()
-
+        for kk in self.keys: self.keys[kk] = False; self.ev_state[kk] = False
+        self.pressed.clear(); self._last_seen.clear()
     def stop(self):
-        # cleanup evdev native devices
         try:
-            if self.native_evdev and self.evdev_devices:
-                for d in self.evdev_devices:
+            if self.wrapper:
+                try: self.wrapper.close()
+                except: pass
+            if getattr(self, "native_fd_map", None):
+                for d in list(self.native_fd_map.values()):
                     try: d.close()
                     except: pass
         except Exception:
             pass
-        # cleanup wrapper
-        try:
-            if self.wrapper_evdev and self.wrapper:
-                try: self.wrapper.close()
-                except: pass
-        except Exception:
-            pass
-        # restore termios
-        if self.termios_mode and self.termios_saved is not None:
+        if self.term_mode and self._term_saved is not None:
             try:
                 import termios
-                termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self.termios_saved)
+                termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
             except Exception:
                 pass
 
-# --- Platform, physics, rendering (unchanged logic) ---
 class Platform:
     def __init__(self,d, start_t=0.0):
         self.ox,self.oy,self.w = d['x'],d['y'],d['w']
@@ -387,8 +299,7 @@ def load_level(path, platform_timers=None):
     lines = [l.rstrip("\r\n") for l in parts[0].strip().split('\n') if l != ""]
     w = max(len(l) for l in lines) if lines else 0
     grid = [list(l.ljust(w,' ')) for l in lines]
-    plats, title = [], os.path.splitext(os.path.basename(path))[0]
-    meta = {}
+    plats, title = [], os.path.splitext(os.path.basename(path))[0]; meta = {}
     if len(parts) > 1:
         try:
             d = json.loads(parts[1])
@@ -397,10 +308,9 @@ def load_level(path, platform_timers=None):
                 pdata = d.get("platforms", [])
                 for i, p in enumerate(pdata):
                     t_start = platform_timers[i] if platform_timers and i < len(platform_timers) else 0.0
-                    mp = Platform(p, t_start)
-                    plats.append(mp)
-                    for i in range(p['w']):
-                        gy,gx = int(p['y']), int(p['x'])+i
+                    mp = Platform(p, t_start); plats.append(mp)
+                    for j in range(p['w']):
+                        gy,gx = int(p['y']), int(p['x'])+j
                         if 0<=gy<len(grid) and 0<=gx<len(grid[0]): grid[gy][gx] = ' '
         except: pass
     return grid, plats, title, meta
@@ -411,8 +321,7 @@ def is_solid(grid,x,y):
         if ch in ('C','S','G',' '): return False
         p = get_plugin(ch)
         if p and 'runtime' in p:
-            s = p['runtime'].get('solid')
-            return bool(s(grid,x,y)) if callable(s) else bool(s)
+            s = p['runtime'].get('solid'); return bool(s(grid,x,y)) if callable(s) else bool(s)
         return ch == TILES['SOLID']
     return True
 
@@ -441,8 +350,7 @@ def resolve_char(grid, plats, cx, cy, title, default):
 def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time, lnum, ltitle, vis=True):
     h,w = stdscr.getmaxyx(); stdscr.erase()
     gh,gw = len(grid), len(grid[0]) if grid else 0
-    ox = (w-gw)//2 if gw < w else 0
-    oy = (h-gh)//2 if gh < h else 0
+    ox = (w-gw)//2 if gw < w else 0; oy = (h-gh)//2 if gh < h else 0
     sx = int(max(0, min(cx, max(0, gw-w)))) if gw>=w else 0
     sy = int(max(0, min(cy, max(0, gh-h)))) if gh>=h else 0
     for scr_y in range(h):
@@ -492,10 +400,8 @@ def draw_centered_menu(stdscr, title, opts, selected_idx):
 def show_in_game_menu(stdscr, allow_save=True):
     opts = ["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu", "Save Position (Slot)", "Clear Slot Data"])
-
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"
     opts.extend([quit_txt, "Cancel"])
-
     idx = 0; stdscr.nodelay(False)
     while True:
         draw_centered_menu(stdscr, "PAUSE MENU", opts, idx)
@@ -515,103 +421,62 @@ def show_in_game_menu(stdscr, allow_save=True):
 
 # --- ARCADE NAME ENTRY (unchanged) ---
 def arcade_name_entry(stdscr, total_time):
-    stdscr.nodelay(False)
-    name = ""
+    stdscr.nodelay(False); name = ""
     while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        cy, cx = h // 2, w // 2
-
-        # Title
-        title = "★ CONGRATULATIONS! ★"
-        stdscr.addstr(cy - 5, cx - len(title)//2, title, curses.A_BOLD)
-
-        time_str = f"FINAL TIME: {total_time:.2f}s"
-        stdscr.addstr(cy - 3, cx - len(time_str)//2, time_str)
-
-        # Name Input
-        prompt = "ENTER INITIALS:"
-        stdscr.addstr(cy - 1, cx - len(prompt)//2, prompt, curses.A_UNDERLINE)
-
-        # Blinking cursor simulation
-        field_disp = f" {name} "
-        if (int(time.time() * 2) % 2) == 0: field_disp += "█"
-        else: field_disp += " "
-
+        stdscr.erase(); h,w = stdscr.getmaxyx(); cy, cx = h//2, w//2
+        title = "★ CONGRATULATIONS! ★"; stdscr.addstr(cy - 5, cx - len(title)//2, title, curses.A_BOLD)
+        time_str = f"FINAL TIME: {total_time:.2f}s"; stdscr.addstr(cy - 3, cx - len(time_str)//2, time_str)
+        prompt = "ENTER INITIALS:"; stdscr.addstr(cy - 1, cx - len(prompt)//2, prompt, curses.A_UNDERLINE)
+        field_disp = f" {name} " + ("█" if (int(time.time()*2)%2)==0 else " ")
         stdscr.addstr(cy + 1, cx - len(field_disp)//2, field_disp, curses.A_REVERSE)
         stdscr.addstr(cy + 3, cx - 13, "TYPE NAME - ENTER TO SUBMIT", curses.A_DIM)
-
         stdscr.refresh()
-
         k = stdscr.getch()
-        if k in (10, 13): # Enter
-            return name if len(name) > 0 else "AAA"
-        elif k in (curses.KEY_BACKSPACE, 127, 8):
-            name = name[:-1]
-        elif 32 <= k <= 126 and len(name) < 10:
-            name += chr(k).upper()
+        if k in (10,13): return name if len(name)>0 else "AAA"
+        elif k in (curses.KEY_BACKSPACE,127,8): name = name[:-1]
+        elif 32 <= k <= 126 and len(name) < 10: name += chr(k).upper()
 
 # --- GAME LOOP ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
-
-    p_timers = []
-    plugin_data = {}
+    p_timers = []; plugin_data = {}
     if resume_state:
-         p_timers = resume_state.get("platform_timers", [])
-         plugin_data = resume_state.get("plugin_state", {})
-
+         p_timers = resume_state.get("platform_timers", []); plugin_data = resume_state.get("plugin_state", {})
     grid, plats, title, meta = load_level(level_file, p_timers)
     if not grid: return "NO_FILE", 0.0
-
-    px,py = 1.5,1.5
-    start_cp = None
+    px,py = 1.5,1.5; start_cp = None
     for y,row in enumerate(grid):
         for x,cell in enumerate(row):
             if cell == TILES['SPAWN']:
-                px,py = x+0.5, y+0.5
-                start_cp = (x+0.5, y+0.5)
-                grid[y][x] = ' '
+                px,py = x+0.5, y+0.5; start_cp = (x+0.5, y+0.5); grid[y][x] = ' '
     if start_cp is None: start_cp = (px,py)
-
     vx,vy,cp = 0.0, 0.0, start_cp
-
     if resume_state:
         try:
             saved_f = resume_state.get("level_file", "")
             if saved_f and (os.path.basename(saved_f) == os.path.basename(level_file)):
                 r_px, r_py = float(resume_state.get("px", -1)), float(resume_state.get("py", -1))
                 if r_px > 0 and r_py > 0:
-                    px, py = r_px, r_py
-                    vx = float(resume_state.get("vx", 0.0))
-                    vy = float(resume_state.get("vy", 0.0))
+                    px, py = r_px, r_py; vx = float(resume_state.get("vx", 0.0)); vy = float(resume_state.get("vy", 0.0))
                     if "cp" in resume_state: cp = tuple(resume_state["cp"])
         except: pass
-
-    cx,cy=0,0
-    fps_h = deque(maxlen=30)
+    cx,cy=0,0; fps_h = deque(maxlen=30)
     start,last,cur_t,msg,mend = time.time(), time.time(), 0.0, None, 0
-    ap,ap_off = None,0.0
-    stdscr.nodelay(True)
+    ap,ap_off = None,0.0; stdscr.nodelay(True)
     def make_game_state(): return {"grid":grid, "platforms":plats, "level":title, "meta":meta}
 
     while True:
         inp.update(stdscr)
-        # PAUSE / MENU: now reliably triggers from evdev/native mapping, wrapper, termios, or curses
         if inp.was('MENU') or inp.was('QUIT'):
-            # deliberately keep menu drawing path identical to previous behavior
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset+cur_t, level_num, title)
             choice = show_in_game_menu(stdscr, allow_save=allow_save)
             if choice in ("RESUME","CANCEL"):
                 inp.clear(); last = time.time()
             elif choice == "SAVE_ONLY":
                 if SAVE_SLOT_PATH:
-                    save = {
-                        "level_file": os.path.abspath(level_file), "level_num": level_num,
-                        "px": px, "py": py, "vx": vx, "vy": vy, "cp": cp, "tot_time": t_offset + cur_t,
-                        "platform_timers": [p.t for p in plats],
-                        "plugin_state": plugin_data
-                    }
+                    save = {"level_file": os.path.abspath(level_file), "level_num": level_num,
+                            "px": px, "py": py, "vx": vx, "vy": vy, "cp": cp, "tot_time": t_offset + cur_t,
+                            "platform_timers": [p.t for p in plats], "plugin_state": plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save); msg="SAVED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
                 inp.clear(); last=time.time()
@@ -621,19 +486,15 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 inp.clear(); last=time.time()
             elif choice == "SAVE_QUIT":
                 if SAVE_SLOT_PATH:
-                    save = {
-                        "level_file": os.path.abspath(level_file), "level_num": level_num,
-                        "px": px, "py": py, "vx": vx, "vy": vy, "cp": cp, "tot_time": t_offset + cur_t,
-                        "platform_timers": [p.t for p in plats],
-                        "plugin_state": plugin_data
-                    }
+                    save = {"level_file": os.path.abspath(level_file), "level_num": level_num,
+                            "px": px, "py": py, "vx": vx, "vy": vy, "cp": cp, "tot_time": t_offset + cur_t,
+                            "platform_timers": [p.t for p in plats], "plugin_state": plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save)
                 return "QUIT", 0.0
             elif choice == "QUIT_NO_SAVE":
                 return "QUIT", 0.0
 
-        now = time.time()
-        dt = min(now-last, 0.1); last=now; dt = DT if dt<0 else dt
+        now = time.time(); dt = min(now-last, 0.1); last=now; dt = DT if dt<0 else dt
         cur_t = now - start
         for p in plats: p.update(dt)
 
@@ -688,8 +549,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 npy = py + vy * step
                 if check_rect(grid, px-PHYS['HW'], npy-PHYS['HH'], px+PHYS['HW'], npy+PHYS['HH']):
                     if vy > 0:
-                        ly = int(math.floor(npy + PHYS['HH']))
-                        py, vy = ly - PHYS['HH'] - 0.001, 0
+                        ly = int(math.floor(npy + PHYS['HH'])); py, vy = ly - PHYS['HH'] - 0.001, 0
                         for lx in {int(px), int(px-PHYS['HW']+0.01), int(px+PHYS['HW']-0.01)}:
                             if 0<=ly<len(grid) and 0<=lx<len(grid[0]):
                                 pmeta = get_plugin(grid[ly][lx])
@@ -767,23 +627,17 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 def main(stdscr):
     global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
     curses.curs_set(0)
-    # Read TF2_PREFER_EVDEV env var by default; InputEngine will honor it if set
-    inp = InputEngine(prefer_evdev_env=True)
+    inp = InputEngine(honor_env=True)  # honors TF2_PREFER_EVDEV env var if set by menu
     mode, path, tot_t, lvl = "CAMP", "", 0.0, 1
     resume_state = None
 
-    args = sys.argv[1:]
-    i = 0
+    args = sys.argv[1:]; i = 0
     while i < len(args):
         a = args[i]
-        if a == "--slot" and i+1 < len(args):
-            SAVE_SLOT_PATH = args[i+1]; i += 2
-        elif a == "--resume":
-            RESUME_FLAG = True; i += 1
-        elif a == "--speedrun":
-            SPEEDRUN_MODE = True; i += 1
-        else:
-            mode, path = "SNGL", a; i += 1
+        if a == "--slot" and i+1 < len(args): SAVE_SLOT_PATH = args[i+1]; i += 2
+        elif a == "--resume": RESUME_FLAG = True; i += 1
+        elif a == "--speedrun": SPEEDRUN_MODE = True; i += 1
+        else: mode, path = "SNGL", a; i += 1
 
     if RESUME_FLAG and SAVE_SLOT_PATH:
         resume_state = load_saved_game_from(SAVE_SLOT_PATH)
@@ -791,8 +645,7 @@ def main(stdscr):
             saved_lvl = int(resume_state.get("level_num", 1))
             check_path = os.path.join(DIRS['CAMP'], f"level{saved_lvl}.txt")
             if resume_state.get("completed", False) or not os.path.exists(check_path):
-                resume_state = None
-                lvl = 1; tot_t = 0.0
+                resume_state = None; lvl = 1; tot_t = 0.0
             else:
                 lvl = saved_lvl
                 if "tot_time" in resume_state: tot_t = float(resume_state["tot_time"])
@@ -800,31 +653,21 @@ def main(stdscr):
     try:
         while True:
             if mode == "CAMP":
-                if resume_state and "level_file" in resume_state:
-                    fpath = resume_state["level_file"]
-                else:
-                    fpath = os.path.join(DIRS['CAMP'], f"level{lvl}.txt")
+                fpath = resume_state["level_file"] if resume_state and "level_file" in resume_state else os.path.join(DIRS['CAMP'], f"level{lvl}.txt")
             else:
                 fpath = path if os.path.exists(path) else os.path.join(DIRS['LEVELS'], path)
 
             if not os.path.exists(fpath):
-                # CAMPAIGN/SPEEDRUN END CONDITION
                 if mode == "CAMP" and lvl > 1:
                     if SAVE_SLOT_PATH:
                         if SPEEDRUN_MODE: clear_slot(SAVE_SLOT_PATH)
                         else: save_game_state_to(SAVE_SLOT_PATH, {"level_num": 1, "completed": True})
-
-                    # ASK FOR NAME IF SPEEDRUN MODE, ELSE AUTO-SAVE
                     if SPEEDRUN_MODE:
-                        player_name = arcade_name_entry(stdscr, tot_t)
-                        save_score("speedrun_camp", tot_t, player_name)
+                        player_name = arcade_name_entry(stdscr, tot_t); save_score("speedrun_camp", tot_t, player_name)
                     else:
                         save_score("campaign", tot_t, "Player")
-
-                    stdscr.erase()
-                    stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD)
+                    stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD)
                     stdscr.refresh(); time.sleep(3)
-
                 elif mode == "CAMP":
                     stdscr.addstr(0,0,"Error: No Campaign Levels"); stdscr.refresh(); time.sleep(2)
                 return
@@ -832,7 +675,6 @@ def main(stdscr):
             can_save_in_menu = (mode=="CAMP" and not SPEEDRUN_MODE)
             res, el = play_level(stdscr, fpath, inp, lvl, tot_t, resume_state=resume_state, allow_save=can_save_in_menu)
             resume_state = None
-
             if res == "QUIT": return
             if res == "NEXT_LEVEL":
                 stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"COMPLETED! {el:.2f}s", curses.A_BOLD)
@@ -841,29 +683,17 @@ def main(stdscr):
                     inp.update(stdscr)
                     if inp.was('CONTINUE') or inp.was('JUMP'): inp.clear(); break
                     time.sleep(0.05)
-
                 if mode == "SNGL":
-                    # Also ask for name on single level speedrun
                     if SPEEDRUN_MODE:
-                        player_name = arcade_name_entry(stdscr, el)
-                        save_score(f"speedrun_{os.path.basename(fpath)}", el, player_name)
+                        player_name = arcade_name_entry(stdscr, el); save_score(f"speedrun_{os.path.basename(fpath)}", el, player_name)
                     else:
                         save_score(os.path.basename(fpath), el, "Player")
                     return
-
-                tot_t += el
-                lvl += 1
-
+                tot_t += el; lvl += 1
                 if mode == "CAMP" and SAVE_SLOT_PATH and not SPEEDRUN_MODE:
                     next_file = os.path.join(DIRS['CAMP'], f"level{lvl}.txt")
-                    save = {
-                        "level_file": os.path.abspath(next_file),
-                        "level_num": lvl,
-                        "tot_time": tot_t,
-                        "px": -1, "py": -1, "vx": 0, "vy": 0,
-                        "platform_timers": [],
-                        "plugin_state": {}
-                    }
+                    save = {"level_file": os.path.abspath(next_file), "level_num": lvl, "tot_time": tot_t,
+                            "px": -1, "py": -1, "vx": 0, "vy": 0, "platform_timers": [], "plugin_state": {}}
                     save_game_state_to(SAVE_SLOT_PATH, save)
 
     except KeyboardInterrupt:
@@ -875,3 +705,4 @@ if __name__ == "__main__":
     for d in DIRS.values():
         if not d.endswith('.json'): os.makedirs(d, exist_ok=True)
     curses.wrapper(main)
+
