@@ -1,182 +1,229 @@
-class InputEngine:
-    def __init__(self, honor_env=True, hold_timeout=0.6):
-        self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
-        self.pressed = set()
-        self.ev_state = {k: False for k in self.keys}
-        self._last_seen = {}
-        self._hold_timeout = float(hold_timeout)
+#!/usr/bin/env python3
+"""
+evdev_input.py - Low-latency input wrapper.
+Strategies:
+1. Evdev: Direct kernel access (Best, requires root/group permissions).
+2. X11: Direct X server polling (Best for Crostini/Desktop Linux, no root needed).
+3. Termios: Stdin fallback (Universal, but suffers from OS repeat delay).
+"""
+import select, os, sys, time, ctypes
+from ctypes import cdll, create_string_buffer
 
-        env = os.environ.get("TF2_PREFER_EVDEV")
-        self.prefer_evdev = True if env is None else (env == "1") if honor_env else True
+# ---------------- 1. Evdev Driver (Native Linux) ----------------
+_HAVE_EVDEV = True
+try:
+    from evdev import InputDevice, list_devices, ecodes
+except Exception:
+    _HAVE_EVDEV = False
 
-        # try wrapper first
-        self.wrapper = None
-        try:
-            import evdev_input as evw
-            self.wrapper = evw.EvdevInput()
-        except Exception:
-            self.wrapper = None
+_EVDEV_MAPPING = {}
+if _HAVE_EVDEV:
+    _EVDEV_MAPPING = {
+        ecodes.KEY_LEFT: 'LEFT',   ecodes.KEY_RIGHT: 'RIGHT',
+        ecodes.KEY_UP: 'UP',       ecodes.KEY_DOWN: 'DOWN',
+        ecodes.KEY_W: 'UP',        ecodes.KEY_A: 'LEFT',
+        ecodes.KEY_S: 'DOWN',      ecodes.KEY_D: 'RIGHT',
+        ecodes.KEY_Z: 'Z',         ecodes.KEY_SPACE: 'SPACE',
+        ecodes.KEY_ENTER: 'ENTER', ecodes.KEY_Q: 'Q',
+    }
 
-        # native evdev if wrapper not present
-        self.native_fd_map = {}
-        self.native_map = {}
-        if self.wrapper is None and self.prefer_evdev:
+class EvdevInput:
+    def __init__(self, device_paths=None):
+        self.devices = []
+        self.fd_map = {}
+        # Auto-discovery logic
+        paths = device_paths if device_paths else list_devices()
+        for p in paths:
             try:
-                from evdev import InputDevice, list_devices, ecodes
-                CODE_TO_TOKEN = {
-                    ecodes.KEY_LEFT:'LEFT', ecodes.KEY_RIGHT:'RIGHT',
-                    ecodes.KEY_UP:'UP', ecodes.KEY_DOWN:'DOWN',
-                    ecodes.KEY_Z:'Z', ecodes.KEY_SPACE:'SPACE',
-                    ecodes.KEY_R:'R', ecodes.KEY_Q:'Q',
-                    ecodes.KEY_A:'A', ecodes.KEY_D:'D', ecodes.KEY_H:'H',
-                    ecodes.KEY_ENTER:'CONTINUE', getattr(ecodes,'KEY_M',None):'M'
-                }
-                CODE_TO_TOKEN = {k:v for k,v in CODE_TO_TOKEN.items() if k is not None}
-                devs=[]
-                for p in list_devices():
-                    try:
-                        d = InputDevice(p)
-                        caps=d.capabilities()
-                        if hasattr(caps,'__contains__') and ecodes.EV_KEY in caps:
-                            devs.append(d)
-                    except Exception:
-                        pass
-                self.native_fd_map = {d.fd:d for d in devs}
-                self.native_map = CODE_TO_TOKEN
-            except Exception:
-                self.native_fd_map = {}; self.native_map = {}
+                d = InputDevice(p)
+                caps = d.capabilities()
+                if hasattr(caps, '__contains__') and ecodes.EV_KEY in caps:
+                    self.devices.append(d)
+            except Exception: pass
+        self.fd_map = {d.fd: d for d in self.devices}
 
-        # termios fallback
-        self.term_mode = False; self.stdin_fd = None; self._term_saved = None
-        if not self.wrapper and not self.native_fd_map:
-            try:
-                import tty, termios
-                self.stdin_fd = None
-                # Termios driver uses evdev_input.TermiosInput via import when game asks wrapper — but keep flag here
-                self.term_mode = True
-            except Exception:
-                self.term_mode = False
-
-        # canonical token map
-        self.token_map = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
-                          'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
-                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','Z':'JUMP','H':'LEFT'}
-
-    def _poll_native(self, timeout=0.0):
-        if not self.native_fd_map: return []
+    def poll(self, timeout=0.0):
+        if not self.fd_map: return []
+        events = []
         try:
-            r,_,_ = select.select(list(self.native_fd_map.keys()), [], [], timeout)
-        except Exception:
-            return []
-        out=[]
-        for fd in r:
-            d=self.native_fd_map.get(fd)
-            if not d: continue
-            try:
-                for ev in d.read():
-                    if ev.type == 1:
-                        token=self.native_map.get(ev.code)
-                        if token: out.append((token,int(ev.value)))
-            except (BlockingIOError, InterruptedError):
-                continue
-            except Exception:
-                continue
-        return out
+            r, _, _ = select.select(list(self.fd_map.keys()), [], [], timeout)
+            for fd in r:
+                dev = self.fd_map.get(fd)
+                for ev in dev.read():
+                    if ev.type == ecodes.EV_KEY:
+                        token = _EVDEV_MAPPING.get(ev.code)
+                        if token and ev.value < 2: # 0=Up, 1=Down, 2=Repeat (ignore 2)
+                            events.append((token, int(ev.value)))
+        except Exception: return []
+        return events
 
-    def _poll_wrapper(self, timeout=0.0):
+    def close(self):
+        for d in self.devices:
+            try: d.close()
+            except: pass
+
+# ---------------- 2. X11 Driver (Crostini / Desktop) ----------------
+# This uses ctypes to query the keyboard state directly from X11.
+# It bypasses terminal processing and OS repeat delays.
+class X11Input:
+    def __init__(self):
         try:
-            if self.wrapper: return self.wrapper.poll(timeout)
-        except Exception:
-            pass
-        return []
+            # Load X11 library (standard on almost all Linux/Crostini)
+            self.x11 = cdll.LoadLibrary("libX11.so.6")
+            # Open default display
+            self.disp = self.x11.XOpenDisplay(None)
+            if not self.disp: raise Exception("No X Display")
+        except Exception as e:
+            raise ImportError(f"X11 unavailable: {e}")
 
-    def _poll_term(self, timeout=0.0):
-        # call into wrapper's TermiosInput if it's present, else nothing
+        self._last_state = set()
+        
+        # Hardcoded X11 Keycodes (Works on most Standard US Layouts)
+        # Scan code + 8 = X11 Keycode usually.
+        self.keymap = {
+            111: 'UP',    116: 'DOWN',  113: 'LEFT',  114: 'RIGHT', # Arrows
+            25:  'UP',    38:  'LEFT',  39:  'DOWN',  40:  'RIGHT', # WASD
+            52:  'Z',     65:  'SPACE', 36:  'ENTER', 24:  'Q',
+        }
+
+    def poll(self, timeout=0.0):
+        # Prepare a 32-byte buffer for the key vector
+        keys_return = create_string_buffer(32)
+        # Query the hardware state
+        self.x11.XQueryKeymap(self.disp, keys_return)
+        
+        current_state = set()
+        events = []
+        
+        # Check specific keys we care about
+        for code, token in self.keymap.items():
+            byte_index = code // 8
+            bit_index = code % 8
+            # Check if the bit is set
+            is_down = (ord(keys_return[byte_index]) & (1 << bit_index)) != 0
+            
+            if is_down:
+                current_state.add(token)
+
+        # Generate events based on state changes
+        # Key Down
+        for token in current_state - self._last_state:
+            events.append((token, 1))
+        # Key Up
+        for token in self._last_state - current_state:
+            events.append((token, 0))
+            
+        self._last_state = current_state
+        
+        # Simulate wait if timeout requested (since XQuery is instant)
+        if timeout > 0 and not events:
+            time.sleep(timeout)
+            
+        return events
+
+    def close(self):
+        if hasattr(self, 'disp') and self.disp:
+            self.x11.XCloseDisplay(self.disp)
+
+# ---------------- 3. Termios Driver (Fallback) ----------------
+class TermiosInput:
+    def __init__(self):
+        import tty, termios
+        self._fd = sys.stdin.fileno()
+        self._termios = termios
+        self._old = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        
+        self._buf = ""
+        self._held_keys = {} # token -> timestamp
+        # Timeout to consider a key released (approx 2-3 frames at 60fps)
+        self._release_timeout = 0.05 
+        
+        self.maps = {
+            "\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
+            "w": "UP", "a": "LEFT", "s": "DOWN", "d": "RIGHT",
+            " ":"SPACE", "\n":"ENTER", "z":"Z", "q":"Q"
+        }
+
+    def poll(self, timeout=0.0):
+        # 1. Read all pending Input
+        events = []
+        cur_time = time.time()
+        
         try:
-            import evdev_input
-            # evdev_input.open_input will pick termios or evdev depending on env; but we already tried wrapper earlier.
-            # If there's no wrapper object, create a temporary TermiosInput and poll it.
-            if hasattr(evdev_input, "TermiosInput"):
-                t = evdev_input.TermiosInput()
-                evs = t.poll(timeout)
-                t.close()
-                return evs
-        except Exception:
-            pass
-        return []
+            if select.select([sys.stdin], [], [], timeout)[0]:
+                self._buf += os.read(self._fd, 1024).decode(errors="ignore")
+        except: pass
 
-    def update(self, stdscr):
-        evs=[]
-        if self.wrapper:
-            evs += self._poll_wrapper(0.0)
-        elif self.native_fd_map:
-            evs += self._poll_native(0.0)
-        elif self.term_mode:
-            evs += self._poll_term(0.0)
+        # 2. Parse Buffer
+        while self._buf:
+            matched = False
+            for seq, token in self.maps.items():
+                if self._buf.startswith(seq):
+                    # logic: If key wasn't held, emit DOWN (1). Update timestamp.
+                    if token not in self._held_keys:
+                        events.append((token, 1))
+                    self._held_keys[token] = cur_time
+                    self._buf = self._buf[len(seq):]
+                    matched = True
+                    break
+            if not matched:
+                self._buf = self._buf[1:] # discard unknown
 
-        now = time.time()
-        for t,v in evs:
-            mapped = self.token_map.get(t) or self.token_map.get(str(t).upper())
-            if not mapped: continue
-            if v == 1:
-                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
-            elif v == 0:
-                self.ev_state[mapped] = False
-                if mapped in self._last_seen: del self._last_seen[mapped]
-            elif v == 2:
-                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
+        # 3. Simulate Key Up events based on timeout
+        # If we haven't seen the char in X seconds, assume user let go.
+        # Note: This is imperfect. It can't bridge the initial OS delay gap (500ms),
+        # but it handles rapid repeat well.
+        released = []
+        for token, ts in self._held_keys.items():
+            if cur_time - ts > self._release_timeout:
+                events.append((token, 0))
+                released.append(token)
+        
+        for r in released:
+            del self._held_keys[r]
 
-        # For termios fallback: synthesize per-frame pressed events for held keys so was('JUMP') fires every frame
-        if self.term_mode or (self.wrapper is None and not self.native_fd_map):
-            for k,held in list(self.ev_state.items()):
-                if held:
-                    self.pressed.add(k)
-                    self._last_seen[k] = now
+        return events
 
-        # decay holds when we haven't seen a press (only for term-style input)
-        if self.term_mode:
-            cutoff = now - self._hold_timeout
-            stale = [k for k,t in self._last_seen.items() if t < cutoff]
-            for k in stale:
-                self.ev_state[k] = False
-                del self._last_seen[k]
+    def close(self):
+        try: self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old)
+        except: pass
 
-        # always consume curses getch to allow menu keys to work
-        curses_keys = {k: False for k in self.keys}
+# ---------------- Factory ----------------
+def open_input():
+    # Priority 1: Evdev (Hardware raw)
+    if _HAVE_EVDEV:
         try:
-            while True:
-                k = stdscr.getch()
-                if k == -1: break
-                n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
-                     ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
-                     ord('m'):'MENU', ord('M'):'MENU', ord('\n'):'CONTINUE', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
-                if n:
-                    curses_keys[n] = True
-                    self.pressed.add(n)
-                    if n == 'JUMP':
-                        curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
-        except Exception:
-            pass
+            print("Input: Trying Evdev...", file=sys.stderr)
+            drv = EvdevInput()
+            if drv.devices: return drv
+        except: pass
 
-        # finalize combined state
-        for k in self.keys:
-            self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
+    # Priority 2: X11 Direct (Crostini / Desktop)
+    try:
+        # Check if DISPLAY env var is set (implies X11/Wayland presence)
+        if os.environ.get("DISPLAY"):
+            print("Input: Trying X11...", file=sys.stderr)
+            return X11Input()
+    except Exception as e:
+        pass
 
-    def was(self,k): return k in self.pressed
-    def down(self,k): return bool(self.keys.get(k, False))
-    def clear(self): self.pressed.clear()
-    def reset(self):
-        for kk in self.keys: self.keys[kk]=False; self.ev_state[kk]=False
-        self.pressed.clear(); self._last_seen.clear()
-    def stop(self):
-        try:
-            if self.wrapper:
-                try: self.wrapper.close()
-                except: pass
-            if getattr(self, "native_fd_map", None):
-                for d in list(self.native_fd_map.values()):
-                    try: d.close()
-                    except: pass
-        except Exception:
-            pass
-        # termios cleanup handled by TermiosInput.close() if used via wrapper
+    # Priority 3: Termios (Stdin fallback)
+    print("Input: Fallback to Termios...", file=sys.stderr)
+    return TermiosInput()
+
+# ---------------- Test Code ----------------
+if __name__ == "__main__":
+    inp = open_input()
+    print("Running... Press 'Q' to quit.")
+    try:
+        while True:
+            evs = inp.poll(timeout=0.016) # ~60 FPS poll rate
+            for t, v in evs:
+                state = "DOWN" if v == 1 else "UP"
+                print(f"Event: {t} {state}")
+                if t == 'Q' and v == 1: raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    finally:
+        inp.close()
