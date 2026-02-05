@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# game.py - TerminalFormer2 (Arcade Name Entry at End)
-# Evdev wrapper-first (exact old behavior) -> native evdev -> termios -> curses
-import curses, time, os, math, sys, json, glob, importlib.util, select
+# game.py - TerminalFormer2 (With Low-Latency X11 Support)
+import curses, time, os, math, sys, json, glob, importlib.util, select, ctypes
 from collections import deque
+from ctypes import c_void_p, c_char_p, c_int, c_uint, c_ulong, create_string_buffer
 
 # --- CONFIG ---
 GRAVITY, JUMP_V, MOVE_SPEED = 90.0, -28.0, 24.0
@@ -66,11 +66,47 @@ def clear_slot(path):
         if path and os.path.exists(path): os.remove(path)
     except: pass
 
-# --- Replace the InputEngine class in your game.py with this class ---
+# --- X11 INPUT HELPER ---
+class X11Input:
+    """Directly queries X11 server for key state. Zero delay, no repeat lag."""
+    def __init__(self):
+        self.lib = None; self.display = None; self.keycodes = {}
+        try:
+            self.lib = ctypes.CDLL('libX11.so.6')
+            self.lib.XOpenDisplay.argtypes = [c_char_p]; self.lib.XOpenDisplay.restype = c_void_p
+            self.lib.XQueryKeymap.argtypes = [c_void_p, c_char_p]
+            self.lib.XKeysymToKeycode.argtypes = [c_void_p, c_ulong]; self.lib.XKeysymToKeycode.restype = c_uint
+            self.lib.XCloseDisplay.argtypes = [c_void_p]
+            self.display = self.lib.XOpenDisplay(None)
+            if not self.display: raise Exception("No X11 Display")
+
+            # Map standard X11 KeySyms to tokens
+            syms = {'LEFT': 0xFF51, 'RIGHT': 0xFF53, 'UP': 0xFF52, 'DOWN': 0xFF54,
+                    'SPACE': 0x0020, 'Q': 0x0071, 'R': 0x0072, 'M': 0x006D, 'CONTINUE': 0xFF0D, # Return
+                    'W': 0x0077, 'A': 0x0061, 'S': 0x0073, 'D': 0x0064, 'Z': 0x007a}
+            for name, sym in syms.items():
+                code = self.lib.XKeysymToKeycode(self.display, sym)
+                if code != 0: self.keycodes[name] = code
+        except Exception:
+            self.close(); raise
+
+    def close(self):
+        if self.display and self.lib:
+            try: self.lib.XCloseDisplay(self.display)
+            except: pass
+        self.display = None
+
+    def get_pressed(self):
+        if not self.display: return []
+        keys = create_string_buffer(32)
+        self.lib.XQueryKeymap(self.display, keys)
+        pressed = []
+        for name, code in self.keycodes.items():
+            if (keys[code // 8] & (1 << (code % 8))): pressed.append(name)
+        return pressed
+
+# --- INPUT ENGINE ---
 class InputEngine:
-    """Robust input engine: wrapper -> native evdev -> termios -> curses fallback.
-    Keeps exact token mapping so LEFT/RIGHT won't be swapped.
-    """
     def __init__(self, honor_env=True, hold_timeout=0.14):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
         self.pressed = set()
@@ -78,166 +114,119 @@ class InputEngine:
         self._last_seen = {}
         self._hold_timeout = float(hold_timeout)
 
-        # honor TF2_PREFER_EVDEV env var if present
-        env = os.environ.get("TF2_PREFER_EVDEV")
-        self.prefer_evdev = True if env is None else (env == "1") if honor_env else True
-
-        # try wrapper module first (preserve old behavior exactly)
+        # Priority 1: Wrapper (Specific HW)
         self.wrapper = None
         try:
             import evdev_input as evw
             self.wrapper = evw.EvdevInput()
-        except Exception:
-            self.wrapper = None
+        except: pass
 
-        # native evdev fallback (if wrapper missing and available)
-        self.native_map = {}
-        self.native_fd_map = {}
-        if self.wrapper is None and self.prefer_evdev:
+        # Priority 2: Native Evdev (Linux /dev/input - requires root/permissions)
+        self.native_fd_map = {}; self.native_map = {}
+        if not self.wrapper:
             try:
                 from evdev import InputDevice, list_devices, ecodes
-                CODE_TO_TOKEN = {
-                    ecodes.KEY_LEFT: 'LEFT', ecodes.KEY_RIGHT: 'RIGHT',
-                    ecodes.KEY_UP: 'UP', ecodes.KEY_DOWN: 'DOWN',
-                    ecodes.KEY_Z: 'Z', ecodes.KEY_SPACE: 'SPACE',
-                    ecodes.KEY_R: 'R', ecodes.KEY_Q: 'Q',
-                    ecodes.KEY_A: 'A', ecodes.KEY_D: 'D', ecodes.KEY_H: 'H',
-                    ecodes.KEY_ENTER: 'CONTINUE', getattr(ecodes, 'KEY_M', None): 'M'
-                }
-                CODE_TO_TOKEN = {k:v for k,v in CODE_TO_TOKEN.items() if k is not None}
-                devs = []
-                for p in list_devices():
-                    try:
-                        d = InputDevice(p)
-                        caps = d.capabilities()
-                        if hasattr(caps, '__contains__') and ecodes.EV_KEY in caps:
-                            devs.append(d)
-                    except Exception:
-                        pass
-                self.native_fd_map = {d.fd: d for d in devs}
-                self.native_map = CODE_TO_TOKEN
-            except Exception:
-                self.native_fd_map = {}
-                self.native_map = {}
+                devs = [InputDevice(p) for p in list_devices()]
+                self.native_fd_map = {d.fd: d for d in devs if ecodes.EV_KEY in d.capabilities()}
+                if self.native_fd_map:
+                    self.native_map = {
+                        ecodes.KEY_LEFT: 'LEFT', ecodes.KEY_RIGHT: 'RIGHT', ecodes.KEY_UP: 'UP', ecodes.KEY_DOWN: 'DOWN',
+                        ecodes.KEY_Z: 'Z', ecodes.KEY_SPACE: 'SPACE', ecodes.KEY_R: 'R', ecodes.KEY_Q: 'Q',
+                        ecodes.KEY_A: 'A', ecodes.KEY_D: 'D', ecodes.KEY_H: 'H', ecodes.KEY_ENTER: 'CONTINUE', ecodes.KEY_M: 'M'
+                    }
+            except: pass
 
-        # termios fallback if neither wrapper nor native present
-        self.term_mode = False; self.stdin_fd = None; self._term_saved = None
+        # Priority 3: X11 Direct (Best for Chromebook/Desktop without root)
+        self.x11 = None; self.x11_prev = set()
         if not self.wrapper and not self.native_fd_map:
+            try: self.x11 = X11Input()
+            except: pass
+
+        # Priority 4: Termios (Fallback)
+        self.term_mode = False; self.stdin_fd = None; self._term_saved = None
+        if not self.wrapper and not self.native_fd_map and not self.x11:
             try:
                 import tty, termios
                 self.stdin_fd = sys.stdin.fileno()
                 self._term_saved = termios.tcgetattr(self.stdin_fd)
                 tty.setcbreak(self.stdin_fd)
                 self.term_mode = True
-            except Exception:
-                self.term_mode = False
+            except: pass
 
-        # canonical map: tokens we accept -> game tokens
         self.token_map = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
                           'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
-                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','Z':'JUMP','H':'LEFT'}
-
-    def _poll_native(self, timeout=0.0):
-        if not self.native_fd_map: return []
-        try:
-            r,_,_ = select.select(list(self.native_fd_map.keys()), [], [], timeout)
-        except Exception:
-            return []
-        out = []
-        for fd in r:
-            d = self.native_fd_map.get(fd)
-            if not d: continue
-            try:
-                for ev in d.read():
-                    if ev.type == 1:  # EV_KEY
-                        token = self.native_map.get(ev.code)
-                        if token:
-                            out.append((token, int(ev.value)))
-            except (BlockingIOError, InterruptedError):
-                continue
-            except Exception:
-                continue
-        return out
-
-    def _poll_wrapper(self, timeout=0.0):
-        try:
-            if self.wrapper: return self.wrapper.poll(timeout)
-        except Exception:
-            pass
-        return []
-
-    def _poll_term(self, timeout=0.0):
-        if self.stdin_fd is None: return []
-        try:
-            r,_,_ = select.select([self.stdin_fd], [], [], timeout)
-        except Exception:
-            return []
-        if not r: return []
-        try:
-            data = os.read(self.stdin_fd, 64).decode(errors='ignore')
-        except Exception:
-            try: data = sys.stdin.read(1)
-            except Exception: return []
-        out = []
-        i=0
-        while i < len(data):
-            ch = data[i]
-            if ch == '\x1b' and i+2 < len(data) and data[i+1]=='[':
-                code = data[i+2]; i += 3
-                if code == 'A': out.append(('UP',1))
-                elif code == 'B': out.append(('DOWN',1))
-                elif code == 'C': out.append(('RIGHT',1))
-                elif code == 'D': out.append(('LEFT',1))
-                continue
-            up = ch.upper()
-            if up == ' ': out.append(('SPACE',1))
-            elif up in ('\r','\n'): out.append(('CONTINUE',1))
-            elif up == 'R': out.append(('R',1))
-            elif up == 'Q': out.append(('Q',1))
-            elif up == 'M': out.append(('M',1))
-            elif up in ('Z','W'): out.append(('Z',1))
-            elif up == 'A': out.append(('A',1))
-            elif up == 'D': out.append(('D',1))
-            i += 1
-        # update last_seen timestamps to emulate hold behavior
-        now = time.time()
-        for t,_ in out:
-            mapped = self.token_map.get(t, t)
-            if mapped: self._last_seen[mapped] = now
-        return out
+                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
+                          'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'}
 
     def update(self, stdscr):
         evs = []
-        # wrapper preferred (preserve exact behavior)
+        # 1. Wrapper
         if self.wrapper:
-            evs += self._poll_wrapper(0.0)
+            try: evs = self.wrapper.poll(0.0)
+            except: pass
+            for t, v in evs:
+                mapped = self.token_map.get(t)
+                if mapped:
+                    if v == 1: self.pressed.add(mapped); self.ev_state[mapped] = True
+                    elif v == 0: self.ev_state[mapped] = False
+
+        # 2. Native Evdev
         elif self.native_fd_map:
-            evs += self._poll_native(0.0)
+            try:
+                r,_,_ = select.select(self.native_fd_map.keys(), [], [], 0.0)
+                for fd in r:
+                    for ev in self.native_fd_map[fd].read():
+                        if ev.type == 1:
+                            t = self.native_map.get(ev.code)
+                            mapped = self.token_map.get(t)
+                            if mapped:
+                                if ev.value == 1: self.pressed.add(mapped); self.ev_state[mapped] = True
+                                elif ev.value == 0: self.ev_state[mapped] = False
+            except: pass
+
+        # 3. X11 (State Based)
+        elif self.x11:
+            curr = set(self.x11.get_pressed())
+            for t in curr:
+                mapped = self.token_map.get(t)
+                if mapped:
+                    self.ev_state[mapped] = True
+                    if t not in self.x11_prev: self.pressed.add(mapped)
+            # handle releases
+            for t in self.x11_prev:
+                if t not in curr:
+                    mapped = self.token_map.get(t)
+                    if mapped: self.ev_state[mapped] = False
+            self.x11_prev = curr
+
+        # 4. Termios (Fallback)
         elif self.term_mode:
-            evs += self._poll_term(0.0)
+            r,_,_ = select.select([self.stdin_fd], [], [], 0.0)
+            if r:
+                try:
+                    data = os.read(self.stdin_fd, 64).decode(errors='ignore')
+                    for ch in data: # Simple parser for robustness
+                        t = None
+                        if ch.upper() == 'A': t = 'A'
+                        elif ch.upper() == 'D': t = 'D'
+                        elif ch.upper() == 'W': t = 'W'
+                        elif ch.upper() == 'Z': t = 'Z'
+                        elif ch == ' ': t = 'SPACE'
+                        elif ch in '\r\n': t = 'CONTINUE'
+                        elif ch.upper() == 'R': t = 'R'
+                        elif ch.upper() == 'Q': t = 'Q'
+                        elif ch.upper() == 'M': t = 'M'
+                        mapped = self.token_map.get(t)
+                        if mapped:
+                            self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = time.time()
+                except: pass
+            # decay holds
+            now = time.time()
+            for k, t in list(self._last_seen.items()):
+                if now - t > self._hold_timeout:
+                    self.ev_state[k] = False; del self._last_seen[k]
 
-        now = time.time()
-        # map & apply events
-        for t, v in evs:
-            mapped = self.token_map.get(t) or self.token_map.get(str(t).upper())
-            if not mapped: continue
-            if v == 1:
-                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
-            elif v == 0:
-                self.ev_state[mapped] = False
-                if mapped in self._last_seen: del self._last_seen[mapped]
-            elif v == 2:
-                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
-
-        # termios: decay holds that haven't been seen recently (simulate key-up)
-        if self.term_mode:
-            cutoff = now - self._hold_timeout
-            stale = [k for k,t in self._last_seen.items() if t < cutoff]
-            for k in stale:
-                self.ev_state[k] = False
-                del self._last_seen[k]
-
-        # also read curses keys (menu fallback)
+        # Curses Menu Fallback (Always check for basic menu nav)
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
@@ -245,14 +234,9 @@ class InputEngine:
                 if k == -1: break
                 n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
                      ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
-                     ord('m'):'MENU', ord('M'):'MENU', ord('\n'):'CONTINUE', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
-                if n:
-                    curses_keys[n] = True
-                    self.pressed.add(n)
-                    if n == 'JUMP':
-                        curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
-        except Exception:
-            pass
+                     ord('m'):'MENU', ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
+                if n: curses_keys[n] = True; self.pressed.add(n)
+        except: pass
 
         for k in self.keys:
             self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
@@ -262,24 +246,12 @@ class InputEngine:
     def clear(self): self.pressed.clear()
     def reset(self):
         for kk in self.keys: self.keys[kk] = False; self.ev_state[kk] = False
-        self.pressed.clear(); self._last_seen.clear()
+        self.pressed.clear(); self._last_seen.clear(); self.x11_prev.clear()
     def stop(self):
-        try:
-            if self.wrapper:
-                try: self.wrapper.close()
-                except: pass
-            if getattr(self, "native_fd_map", None):
-                for d in list(self.native_fd_map.values()):
-                    try: d.close()
-                    except: pass
-        except Exception:
-            pass
-        if self.term_mode and self._term_saved is not None:
-            try:
-                import termios
-                termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
-            except Exception:
-                pass
+        if self.x11: self.x11.close()
+        if self.term_mode and self._term_saved:
+            import termios
+            termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
 
 class Platform:
     def __init__(self,d, start_t=0.0):
@@ -627,7 +599,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 def main(stdscr):
     global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
     curses.curs_set(0)
-    inp = InputEngine(honor_env=True)  # honors TF2_PREFER_EVDEV env var if set by menu
+    inp = InputEngine(honor_env=True)
     mode, path, tot_t, lvl = "CAMP", "", 0.0, 1
     resume_state = None
 
@@ -677,32 +649,12 @@ def main(stdscr):
             resume_state = None
             if res == "QUIT": return
             if res == "NEXT_LEVEL":
-                stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"COMPLETED! {el:.2f}s", curses.A_BOLD)
-                stdscr.refresh(); curses.flushinp(); time.sleep(0.5)
-                while True:
-                    inp.update(stdscr)
-                    if inp.was('CONTINUE') or inp.was('JUMP'): inp.clear(); break
-                    time.sleep(0.05)
-                if mode == "SNGL":
-                    if SPEEDRUN_MODE:
-                        player_name = arcade_name_entry(stdscr, el); save_score(f"speedrun_{os.path.basename(fpath)}", el, player_name)
-                    else:
-                        save_score(os.path.basename(fpath), el, "Player")
-                    return
+                stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, "LEVEL COMPLETE!", curses.A_BOLD); stdscr.refresh(); time.sleep(0.6)
                 tot_t += el; lvl += 1
-                if mode == "CAMP" and SAVE_SLOT_PATH and not SPEEDRUN_MODE:
-                    next_file = os.path.join(DIRS['CAMP'], f"level{lvl}.txt")
-                    save = {"level_file": os.path.abspath(next_file), "level_num": lvl, "tot_time": tot_t,
-                            "px": -1, "py": -1, "vx": 0, "vy": 0, "platform_timers": [], "plugin_state": {}}
-                    save_game_state_to(SAVE_SLOT_PATH, save)
-
     except KeyboardInterrupt:
         pass
     finally:
         inp.stop()
 
 if __name__ == "__main__":
-    for d in DIRS.values():
-        if not d.endswith('.json'): os.makedirs(d, exist_ok=True)
     curses.wrapper(main)
-
