@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# menu.py - Fixed High Scores (Shows all levels)
+# menu.py - Fixed High Scores (Shows all levels) + Settings toggle for input method (evdev on/off)
 import curses, os, sys, json, subprocess, random, time, math, re
 
 # --- CONFIG ---
@@ -7,6 +7,7 @@ DIRS = {"lvl": "levels", "cmp": "campaignlevels", "plg": "plugins", "sav": "save
 SCORES_FILE = "scores.json"
 BG_SPD = (1, 0)
 PLUGIN_VISUALS = {}
+SETTINGS_FILE = "tf2_settings.json"   # persistent settings stored here
 
 # --- CORE CLASSES & UTILS ---
 class MovingPlatform:
@@ -25,12 +26,36 @@ def ensure_dirs(): [os.makedirs(d, exist_ok=True) for d in DIRS.values()]
 def strip_ansi(t): return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', t)
 def draw_center(stdscr, y, text, attr=0):
     h, w = stdscr.getmaxyx()
-    if 0 <= y < h: stdscr.addstr(y, max(0, (w - len(text)) // 2), text, attr)
+    if 0 <= y < h:
+        try: stdscr.addstr(y, max(0, (w - len(text)) // 2), text, attr)
+        except: pass
+
+# --- SETTINGS persistence ---
+def load_settings():
+    default = {"prefer_evdev": True}
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return {**default, **d}
+    except:
+        pass
+    return default
+
+def save_settings(s):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(s, f, indent=2)
+    except:
+        pass
 
 # --- DATA LOADING ---
 def load_plugins():
     if not os.path.exists(DIRS["plg"]): return
-    sys.path.append(DIRS["plg"])
+    # add plugins dir to import path if not present
+    if DIRS["plg"] not in sys.path:
+        sys.path.append(DIRS["plg"])
     for f in os.listdir(DIRS["plg"]):
         if f.endswith(".py") and f != "__init__.py":
             try:
@@ -70,9 +95,17 @@ def get_bg():
 
 def get_slots():
     ensure_dirs(); s = set()
-    files = [os.path.join(DIRS["sav"], f) for f in os.listdir(DIRS["sav"]) if f.endswith(".json")]
+    files = []
+    if os.path.exists(DIRS["sav"]):
+        files += [os.path.join(DIRS["sav"], f) for f in os.listdir(DIRS["sav"]) if f.endswith(".json")]
     files += [f for f in os.listdir(".") if f.endswith(".json") and ("slot_" in f or "save" in f.lower())]
-    return sorted([f for f in files if os.path.abspath(f) not in s and not s.add(os.path.abspath(f))])
+    # dedupe absolute paths
+    out = []
+    for f in files:
+        ap = os.path.abspath(f)
+        if ap not in s:
+            s.add(ap); out.append(ap)
+    return sorted(out)
 
 def load_json(path):
     try: return json.load(open(path)) if os.path.exists(path) else {}
@@ -80,16 +113,39 @@ def load_json(path):
 
 # --- ACTIONS ---
 def launch(slot=None, resume=False, path=None, speedrun=False):
+    """Launch game.py while honoring saved settings (TF2_PREFER_EVDEV env var).
+       IMPORTANT: place flags before positional path so game.py parses them correctly.
+    """
     curses.endwin()
-    cmd = [sys.executable, "game.py"] + ([path] if path else []) + (["--slot", slot] if slot else [])
-    if resume: cmd.append("--resume")
-    if speedrun: cmd.append("--speedrun")
-    subprocess.run(cmd)
+    settings = load_settings()
+    prefer_evdev = settings.get("prefer_evdev", True)
+    # Build args with flags first (so game.py's sequential parser reads them correctly)
+    cmd = [sys.executable, "game.py"]
+    if slot:
+        cmd += ["--slot", slot]
+    if resume:
+        cmd.append("--resume")
+    if speedrun:
+        cmd.append("--speedrun")
+    if path:
+        # append path last as positional level argument
+        cmd.append(path)
+    # set environment variable that game.py can read (TF2_PREFER_EVDEV="1"/"0")
+    env = os.environ.copy()
+    env["TF2_PREFER_EVDEV"] = "1" if prefer_evdev else "0"
+    try:
+        subprocess.run(cmd, env=env)
+    except Exception:
+        pass
 
 def text_input(stdscr, p):
     curses.echo(); curses.curs_set(1); stdscr.nodelay(False); stdscr.clear()
     draw_center(stdscr, stdscr.getmaxyx()[0]//2 - 2, f" {p} ", curses.A_BOLD)
-    stdscr.refresh(); inp = stdscr.getstr(stdscr.getmaxyx()[0]//2, stdscr.getmaxyx()[1]//2 - 10, 30).decode()
+    stdscr.refresh()
+    try:
+        inp = stdscr.getstr(stdscr.getmaxyx()[0]//2, stdscr.getmaxyx()[1]//2 - 10, 30).decode()
+    except:
+        inp = ""
     curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
     return inp.strip()
 
@@ -116,7 +172,9 @@ def draw_bg_frame(stdscr, data, cx, cy):
                 sx, sy = int(px + p.x), int(py + p.y)
                 if -p.w < sx < w and 0 <= sy < h:
                     s, l = max(0, -sx), min(p.w, w - sx) - max(0, -sx)
-                    if l > 0: stdscr.addstr(sy, sx + s, '█' * l)
+                    if l > 0:
+                        try: stdscr.addstr(sy, sx + s, '█' * l)
+                        except: pass
                 px += gw
             py += gh
     stdscr.attroff(curses.A_DIM)
@@ -135,7 +193,9 @@ def draw_menu(stdscr, data, cx, cy, title, items, sel):
             cur_px = plat.x + p_info[3]
             cur_py = plat.y + p_info[4]
         scr_x = int(cur_px - cx) % gw; scr_y = int(cur_py - cy) % gh
-        if 0 <= scr_y < h and 0 <= scr_x < w: stdscr.addch(scr_y, scr_x, '#', curses.A_DIM)
+        if 0 <= scr_y < h and 0 <= scr_x < w:
+            try: stdscr.addch(scr_y, scr_x, '#', curses.A_DIM)
+            except: pass
     vis_h = min(len(items), max(1, (h-6)//2)) * 2
     sy = max(4, (h//2) - (vis_h//2))
     win_sz = max(1, (h-6)//2); top = max(0, min(sel - win_sz//2, len(items) - win_sz))
@@ -154,8 +214,10 @@ def run_loop(stdscr, bg, title, items, datas):
     sel = 0; cx, cy = 0.0, 0.0; stdscr.nodelay(True); stdscr.timeout(30)
     while True:
         cx += BG_SPD[0]; cy += BG_SPD[1]
-        active = datas[sel] if datas and datas[sel] else bg
-        for obj in (bg[1] + (active[1] if active!=bg and active else [])): obj.update(0.05)
+        active = datas[sel] if datas and sel < len(datas) and datas[sel] else bg
+        for obj in (bg[1] + (active[1] if active!=bg and active else [])):
+            try: obj.update(0.05)
+            except: pass
         draw_menu(stdscr, active, cx, cy, title, items, sel)
         k = stdscr.getch()
         if k == curses.KEY_UP: sel = (sel - 1) % len(items)
@@ -183,7 +245,6 @@ def show_scores(stdscr, bg, cx, cy):
         # 2. INDIVIDUAL LEVELS (Normal & Speedrun)
         r += len(camp_scores[:10]) + 3; draw_center(stdscr, r, "LEVEL RECORDS:", curses.A_BOLD)
 
-        # Filter: Exclude campaign main keys, allow everything else (level1.txt, speedrun_level1.txt)
         custom_keys = sorted([k for k in sc if k not in ("campaign", "speedrun_camp")])
 
         count = 0
@@ -192,12 +253,10 @@ def show_scores(stdscr, bg, cx, cy):
             level_scores = sc[k]
             if level_scores:
                 best = level_scores[0]
-                # Nice formatting
                 if k.startswith("speedrun_"):
                     disp_name = k.replace("speedrun_", "") + " (Speedrun)"
                 else:
                     disp_name = k
-
                 if isinstance(best, dict):
                     draw_center(stdscr, r+1+count, f"{disp_name}: {best['name']} - {best['time']:.2f}s")
                 else:
@@ -209,14 +268,16 @@ def show_scores(stdscr, bg, cx, cy):
 
 # --- MENUS ---
 def menu_custom(stdscr, bg):
-    fs = sorted([f for f in os.listdir(DIRS["lvl"]) if f.endswith(".txt")])
+    fs = sorted([f for f in os.listdir(DIRS["lvl"]) if f.endswith(".txt")]) if os.path.exists(DIRS["lvl"]) else []
     ds = [load_level(os.path.join(DIRS["lvl"], f)) for f in fs]
+    if not fs:
+        draw_center(stdscr, stdscr.getmaxyx()[0]//2, "No custom levels found.", curses.A_BOLD); stdscr.getch(); return
     l, i = run_loop(stdscr, bg, "SELECT CUSTOM LEVEL", [f"{d[2]} ({f})" for f,d in zip(fs, ds)] + ["BACK"], ds + [bg])
     if l != "BACK": launch(path=os.path.join(DIRS["lvl"], fs[i]))
 
 def menu_editor(stdscr, bg):
     while True:
-        fs = sorted([f for f in os.listdir(DIRS["lvl"]) if f.endswith(".txt")])
+        fs = sorted([f for f in os.listdir(DIRS["lvl"]) if f.endswith(".txt")]) if os.path.exists(DIRS["lvl"]) else []
         ds = [load_level(os.path.join(DIRS["lvl"], f)) for f in fs]
         items = ["CREATE NEW LEVEL"] + [f"EDIT: {d[2]} ({f})" for f,d in zip(fs, ds)] + ["BACK"]
         l, i = run_loop(stdscr, bg, "LEVEL EDITOR", items, [bg] + ds + [bg])
@@ -227,7 +288,6 @@ def menu_editor(stdscr, bg):
         elif i <= len(fs): curses.endwin(); subprocess.run([sys.executable, "editor.py", fs[i-1]])
 
 def menu_speedrun(stdscr, bg):
-    # Instant start!
     temp_path = os.path.join(DIRS["sav"], "speedrun_temp.json")
     json.dump({}, open(temp_path, 'w'))
     launch(slot=temp_path, speedrun=True)
@@ -242,7 +302,6 @@ def menu_slots(stdscr, bg):
             d = load_json(p)
             if d.get("campaign_complete", False) or d.get("completed", False):
                 d = {}; json.dump({}, open(p, 'w'))
-
             lf = d.get("level_file")
             if lf and os.path.exists(lf):
                 p_timers = d.get("platform_timers", [])
@@ -262,28 +321,71 @@ def menu_slots(stdscr, bg):
         if l == "NEW SLOT":
             n = text_input(stdscr, "Slot Name:"); n += "" if n.endswith(".json") else ".json"
             if n != ".json":
-                p = os.path.join(DIRS["sav"], n); json.dump({}, open(p, 'w')); launch(slot=p)
-                return
+                # safety: do not overwrite existing unless explicitly desired
+                p = os.path.join(DIRS["sav"], n)
+                if os.path.exists(p):
+                    draw_center(stdscr, stdscr.getmaxyx()[0]//2, "Slot exists - choose a different name.", curses.A_BOLD)
+                    stdscr.getch(); continue
+                json.dump({}, open(p, 'w')); launch(slot=p); return
         else:
             sp = sl[i]; d = load_json(sp); has_sv = "level_file" in d
             opts = (["Resume"] if has_sv else []) + ["New Game", "Delete", "Back"]
-            l2, i2 = run_loop(stdscr, bg, f"SLOT: {os.path.basename(sp)}", opts, [ds[i] if has_sv else bg]*len(opts))
+            # prepare preview datas for each option (if resume, reused preview)
+            preview = [ds[i] if has_sv else bg] * len(opts)
+            l2, i2 = run_loop(stdscr, bg, f"SLOT: {os.path.basename(sp)}", opts, preview)
             if l2 == "Resume": launch(slot=sp, resume=True); return
             if l2 == "New Game": json.dump({}, open(sp, 'w')); launch(slot=sp); return
-            if l2 == "Delete": os.remove(sp)
+            if l2 == "Delete":
+                try: os.remove(sp)
+                except: pass
 
+# --- SETTINGS MENU ---
+def menu_settings(stdscr, bg):
+    """Allow toggling input method preference (Evdev ON/OFF)."""
+    settings = load_settings()
+    opts = []
+    while True:
+        # Build labels
+        ev_on = settings.get("prefer_evdev", True)
+        opts = [f"Evdev: {'ON' if ev_on else 'OFF'}", "Back"]
+        l, i = run_loop(stdscr, bg, "SETTINGS", opts, [bg, bg])
+        if l == "BACK" or l == "Back": break
+        # toggle evdev when selecting first entry
+        if i == 0:
+            settings["prefer_evdev"] = not settings.get("prefer_evdev", True)
+            save_settings(settings)
+            ev_on = settings["prefer_evdev"]
+            # brief feedback
+            stdscr.erase(); draw_center(stdscr, stdscr.getmaxyx()[0]//2, f"Evdev set to {'ON' if ev_on else 'OFF'}", curses.A_BOLD)
+            stdscr.refresh(); time.sleep(0.6)
+        else:
+            break
+
+# --- ENTRYPOINT ---
 def main(stdscr):
     curses.curs_set(0); ensure_dirs(); load_plugins()
     bg = get_bg(); cx = cy = 0
-    ops = [("PLAY CAMPAIGN", lambda: menu_slots(stdscr, bg)),
-           ("SPEEDRUN MODE", lambda: menu_speedrun(stdscr, bg)),
-           ("CUSTOM LEVELS", lambda: menu_custom(stdscr, bg)),
-           ("LEVEL EDITOR", lambda: menu_editor(stdscr, bg)),
-           ("HIGH SCORES", lambda: show_scores(stdscr, bg, cx, cy)),
-           ("QUIT GAME", lambda: sys.exit(0))]
+    ops = [
+        ("PLAY CAMPAIGN", lambda: menu_slots(stdscr, bg)),
+        ("SPEEDRUN MODE", lambda: menu_speedrun(stdscr, bg)),
+        ("CUSTOM LEVELS", lambda: menu_custom(stdscr, bg)),
+        ("LEVEL EDITOR", lambda: menu_editor(stdscr, bg)),
+        ("HIGH SCORES", lambda: show_scores(stdscr, bg, cx, cy)),
+        ("SETTINGS", lambda: menu_settings(stdscr, bg)),
+        ("QUIT GAME", lambda: sys.exit(0))
+    ]
     while True:
-        l, i = run_loop(stdscr, bg, "TerminalFormer2", [o[0] for o in ops], [bg]*len(ops))
-        if l != "BACK": ops[i][1](); load_plugins(); bg = get_bg()
-        else: sys.exit(0)
+        labels = [o[0] for o in ops]
+        l, i = run_loop(stdscr, bg, "TerminalFormer2", labels, [bg]*len(ops))
+        if l != "BACK":
+            try:
+                ops[i][1]()
+            except Exception:
+                pass
+            load_plugins(); bg = get_bg()
+        else:
+            sys.exit(0)
 
-if __name__ == "__main__": curses.wrapper(main)
+if __name__ == "__main__":
+    curses.wrapper(main)
+
