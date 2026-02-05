@@ -105,9 +105,9 @@ class X11Input:
             if (keys[code // 8] & (1 << (code % 8))): pressed.append(name)
         return pressed
 
-# --- INPUT ENGINE ---
+# --- INPUT ENGINE (FIXED FOR CHROMEBOOK) ---
 class InputEngine:
-    def __init__(self, honor_env=True, hold_timeout=0.14):
+    def __init__(self, honor_env=True, hold_timeout=0.15): # Increased timeout slightly for ChromeOS
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
         self.pressed = set()
         self.ev_state = {k: False for k in self.keys}
@@ -159,16 +159,16 @@ class InputEngine:
                           'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'}
 
     def update(self, stdscr):
-        evs = []
         # 1. Wrapper
         if self.wrapper:
-            try: evs = self.wrapper.poll(0.0)
+            try:
+                evs = self.wrapper.poll(0.0)
+                for t, v in evs:
+                    mapped = self.token_map.get(t)
+                    if mapped:
+                        if v == 1: self.pressed.add(mapped); self.ev_state[mapped] = True
+                        elif v == 0: self.ev_state[mapped] = False
             except: pass
-            for t, v in evs:
-                mapped = self.token_map.get(t)
-                if mapped:
-                    if v == 1: self.pressed.add(mapped); self.ev_state[mapped] = True
-                    elif v == 0: self.ev_state[mapped] = False
 
         # 2. Native Evdev
         elif self.native_fd_map:
@@ -199,47 +199,61 @@ class InputEngine:
                     if mapped: self.ev_state[mapped] = False
             self.x11_prev = curr
 
-        # 4. Termios (Fallback)
-        elif self.term_mode:
-            r,_,_ = select.select([self.stdin_fd], [], [], 0.0)
-            if r:
-                try:
-                    data = os.read(self.stdin_fd, 64).decode(errors='ignore')
-                    for ch in data: # Simple parser for robustness
-                        t = None
-                        if ch.upper() == 'A': t = 'A'
-                        elif ch.upper() == 'D': t = 'D'
-                        elif ch.upper() == 'W': t = 'W'
-                        elif ch.upper() == 'Z': t = 'Z'
-                        elif ch == ' ': t = 'SPACE'
-                        elif ch in '\r\n': t = 'CONTINUE'
-                        elif ch.upper() == 'R': t = 'R'
-                        elif ch.upper() == 'Q': t = 'Q'
-                        elif ch.upper() == 'M': t = 'M'
-                        mapped = self.token_map.get(t)
-                        if mapped:
-                            self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = time.time()
-                except: pass
-            # decay holds
+        # 4. Termios & Curses Fallback (Combined Logic)
+        else:
+            # A. Read from Termios (if active)
+            if self.term_mode:
+                r,_,_ = select.select([self.stdin_fd], [], [], 0.0)
+                if r:
+                    try:
+                        data = os.read(self.stdin_fd, 64).decode(errors='ignore')
+                        for ch in data:
+                            t = None
+                            if ch.upper() == 'A': t = 'A'
+                            elif ch.upper() == 'D': t = 'D'
+                            elif ch.upper() == 'W': t = 'W'
+                            elif ch.upper() == 'Z': t = 'Z'
+                            elif ch == ' ': t = 'SPACE'
+                            elif ch in '\r\n': t = 'CONTINUE'
+                            elif ch.upper() == 'R': t = 'R'
+                            elif ch.upper() == 'Q': t = 'Q'
+                            elif ch.upper() == 'M': t = 'M'
+                            mapped = self.token_map.get(t)
+                            if mapped:
+                                self.pressed.add(mapped)
+                                self._last_seen[mapped] = time.time()
+                    except: pass
+
+            # B. Read from Curses (Always check this buffer too!)
+            # FIX: This now updates _last_seen instead of setting a temp boolean
+            try:
+                stdscr.nodelay(True)
+                while True:
+                    k = stdscr.getch()
+                    if k == -1: break
+                    n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
+                         ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
+                         ord('m'):'MENU', ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE',
+                         ord('w'):'JUMP', ord('W'):'JUMP', ord('a'):'LEFT', ord('d'):'RIGHT',
+                         ord('A'):'LEFT', ord('D'):'RIGHT'}.get(k)
+                    if n:
+                        mapped = self.token_map.get(n, n) # Ensure we use the mapped name (e.g. SPACE->JUMP)
+                        self.pressed.add(mapped)
+                        self._last_seen[mapped] = time.time()
+            except: pass
+
+            # C. Apply Decay (This is the smoothing magic)
             now = time.time()
             for k, t in list(self._last_seen.items()):
                 if now - t > self._hold_timeout:
-                    self.ev_state[k] = False; del self._last_seen[k]
+                    self.ev_state[k] = False
+                    del self._last_seen[k]
+                else:
+                    self.ev_state[k] = True
 
-        # Curses Menu Fallback (Always check for basic menu nav)
-        curses_keys = {k: False for k in self.keys}
-        try:
-            while True:
-                k = stdscr.getch()
-                if k == -1: break
-                n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
-                     ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
-                     ord('m'):'MENU', ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
-                if n: curses_keys[n] = True; self.pressed.add(n)
-        except: pass
-
+        # Final Key Update
         for k in self.keys:
-            self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
+            self.keys[k] = self.ev_state.get(k, False)
 
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
