@@ -77,7 +77,7 @@ class X11Input:
             raise ImportError(f"X11 unavailable: {e}")
 
         self._last_state = set()
-        
+
         # Hardcoded X11 Keycodes (Works on most Standard US Layouts)
         # Scan code + 8 = X11 Keycode usually.
         self.keymap = {
@@ -91,17 +91,17 @@ class X11Input:
         keys_return = create_string_buffer(32)
         # Query the hardware state
         self.x11.XQueryKeymap(self.disp, keys_return)
-        
+
         current_state = set()
         events = []
-        
+
         # Check specific keys we care about
         for code, token in self.keymap.items():
             byte_index = code // 8
             bit_index = code % 8
             # Check if the bit is set
             is_down = (ord(keys_return[byte_index]) & (1 << bit_index)) != 0
-            
+
             if is_down:
                 current_state.add(token)
 
@@ -112,13 +112,13 @@ class X11Input:
         # Key Up
         for token in self._last_state - current_state:
             events.append((token, 0))
-            
+
         self._last_state = current_state
-        
+
         # Simulate wait if timeout requested (since XQuery is instant)
         if timeout > 0 and not events:
             time.sleep(timeout)
-            
+
         return events
 
     def close(self):
@@ -133,12 +133,12 @@ class TermiosInput:
         self._termios = termios
         self._old = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)
-        
+
         self._buf = ""
         self._held_keys = {} # token -> timestamp
         # Timeout to consider a key released (approx 2-3 frames at 60fps)
-        self._release_timeout = 0.05 
-        
+        self._release_timeout = 0.05
+
         self.maps = {
             "\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
             "w": "UP", "a": "LEFT", "s": "DOWN", "d": "RIGHT",
@@ -149,7 +149,7 @@ class TermiosInput:
         # 1. Read all pending Input
         events = []
         cur_time = time.time()
-        
+
         try:
             if select.select([sys.stdin], [], [], timeout)[0]:
                 self._buf += os.read(self._fd, 1024).decode(errors="ignore")
@@ -179,7 +179,7 @@ class TermiosInput:
             if cur_time - ts > self._release_timeout:
                 events.append((token, 0))
                 released.append(token)
-        
+
         for r in released:
             del self._held_keys[r]
 
