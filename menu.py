@@ -35,7 +35,7 @@ def load_settings():
     default = {"prefer_evdev": True}
     try:
         if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r") as f:
+            with open(SETTINGS_FILE, "r", encoding='utf-8') as f:
                 d = json.load(f)
                 if isinstance(d, dict):
                     return {**default, **d}
@@ -45,7 +45,7 @@ def load_settings():
 
 def save_settings(s):
     try:
-        with open(SETTINGS_FILE, "w") as f:
+        with open(SETTINGS_FILE, "w", encoding='utf-8') as f:
             json.dump(s, f, indent=2)
     except:
         pass
@@ -69,7 +69,7 @@ def load_plugins():
 def load_level(path, platform_timers=None):
     if not os.path.exists(path): return None, [], "Unknown"
     try:
-        with open(path,'r') as f: parts = f.read().split("__METADATA__")
+        with open(path, 'r', encoding='utf-8') as f: parts = f.read().split("__METADATA__")
         lines = [l.rstrip() for l in parts[0].strip().split('\n')]
         if not lines: return None, [], "Empty"
         w = max(len(l) for l in lines); grid = [list(l.ljust(w)) for l in lines]; plats = []; title = os.path.basename(path)
@@ -108,7 +108,7 @@ def get_slots():
     return sorted(out)
 
 def load_json(path):
-    try: return json.load(open(path)) if os.path.exists(path) else {}
+    try: return json.load(open(path, 'r', encoding='utf-8')) if os.path.exists(path) else {}
     except: return {}
 
 # --- ACTIONS ---
@@ -139,14 +139,20 @@ def launch(slot=None, resume=False, path=None, speedrun=False):
         pass
 
 def text_input(stdscr, p):
-    curses.echo(); curses.curs_set(1); stdscr.nodelay(False); stdscr.clear()
+    curses.echo()
+    try: curses.curs_set(1)
+    except: pass
+    stdscr.nodelay(False); stdscr.clear()
     draw_center(stdscr, stdscr.getmaxyx()[0]//2 - 2, f" {p} ", curses.A_BOLD)
     stdscr.refresh()
     try:
         inp = stdscr.getstr(stdscr.getmaxyx()[0]//2, stdscr.getmaxyx()[1]//2 - 10, 30).decode()
     except:
         inp = ""
-    curses.noecho(); curses.curs_set(0); stdscr.nodelay(True)
+    curses.noecho()
+    try: curses.curs_set(0)
+    except: pass
+    stdscr.nodelay(True)
     return inp.strip()
 
 # --- DRAWING ---
@@ -289,7 +295,10 @@ def menu_editor(stdscr, bg):
 
 def menu_speedrun(stdscr, bg):
     temp_path = os.path.join(DIRS["sav"], "speedrun_temp.json")
-    json.dump({}, open(temp_path, 'w'))
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+    except: pass
     launch(slot=temp_path, speedrun=True)
     if os.path.exists(temp_path):
         try: os.remove(temp_path)
@@ -301,7 +310,7 @@ def menu_slots(stdscr, bg):
         def get_prev(p):
             d = load_json(p)
             if d.get("campaign_complete", False) or d.get("completed", False):
-                d = {}; json.dump({}, open(p, 'w'))
+                d = {}; json.dump({}, open(p, 'w', encoding='utf-8'))
             lf = d.get("level_file")
             if lf and os.path.exists(lf):
                 p_timers = d.get("platform_timers", [])
@@ -326,7 +335,9 @@ def menu_slots(stdscr, bg):
                 if os.path.exists(p):
                     draw_center(stdscr, stdscr.getmaxyx()[0]//2, "Slot exists - choose a different name.", curses.A_BOLD)
                     stdscr.getch(); continue
-                json.dump({}, open(p, 'w')); launch(slot=p); return
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump({}, f)
+                launch(slot=p); return
         else:
             sp = sl[i]; d = load_json(sp); has_sv = "level_file" in d
             opts = (["Resume"] if has_sv else []) + ["New Game", "Delete", "Back"]
@@ -334,7 +345,10 @@ def menu_slots(stdscr, bg):
             preview = [ds[i] if has_sv else bg] * len(opts)
             l2, i2 = run_loop(stdscr, bg, f"SLOT: {os.path.basename(sp)}", opts, preview)
             if l2 == "Resume": launch(slot=sp, resume=True); return
-            if l2 == "New Game": json.dump({}, open(sp, 'w')); launch(slot=sp); return
+            if l2 == "New Game":
+                with open(sp, 'w', encoding='utf-8') as f:
+                    json.dump({}, f)
+                launch(slot=sp); return
             if l2 == "Delete":
                 try: os.remove(sp)
                 except: pass
@@ -363,7 +377,9 @@ def menu_settings(stdscr, bg):
 
 # --- ENTRYPOINT ---
 def main(stdscr):
-    curses.curs_set(0); ensure_dirs(); load_plugins()
+    try: curses.curs_set(0)
+    except: pass
+    ensure_dirs(); load_plugins()
     bg = get_bg(); cx = cy = 0
     ops = [
         ("PLAY CAMPAIGN", lambda: menu_slots(stdscr, bg)),
@@ -388,4 +404,3 @@ def main(stdscr):
 
 if __name__ == "__main__":
     curses.wrapper(main)
-
