@@ -1,170 +1,182 @@
-#!/usr/bin/env python3
-"""
-evdev_input.py - Wrapper for low-latency input, with termios fallback for systems
-where /dev/input is not available (eg. Chromebooks / Crostini).
+class InputEngine:
+    def __init__(self, honor_env=True, hold_timeout=0.6):
+        self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
+        self.pressed = set()
+        self.ev_state = {k: False for k in self.keys}
+        self._last_seen = {}
+        self._hold_timeout = float(hold_timeout)
 
-API:
-    d = EvdevInput(device_paths=None)  # prefer evdev if available, else termios fallback
-    events = d.poll(timeout=0.0)       # returns list of (TOKEN, value)
-    d.close()
-"""
-import select, os, sys, time
+        env = os.environ.get("TF2_PREFER_EVDEV")
+        self.prefer_evdev = True if env is None else (env == "1") if honor_env else True
 
-# Try to import evdev. If available, use it; otherwise we'll provide a termios fallback.
-_HAVE_EVDEV = True
-try:
-    from evdev import InputDevice, list_devices, ecodes
-except Exception:
-    _HAVE_EVDEV = False
+        # try wrapper first
+        self.wrapper = None
+        try:
+            import evdev_input as evw
+            self.wrapper = evw.EvdevInput()
+        except Exception:
+            self.wrapper = None
 
-# mapping when evdev is present
-_ECODE_TO_TOKEN = {}
-if _HAVE_EVDEV:
-    _ECODE_TO_TOKEN = {
-        ecodes.KEY_LEFT: 'LEFT',
-        ecodes.KEY_RIGHT: 'RIGHT',
-        ecodes.KEY_UP: 'UP',
-        ecodes.KEY_DOWN: 'DOWN',
-        ecodes.KEY_Z: 'Z',
-        ecodes.KEY_SPACE: 'SPACE',
-        ecodes.KEY_R: 'R',
-        ecodes.KEY_Q: 'Q',
-        ecodes.KEY_A: 'A',
-        ecodes.KEY_D: 'D',
-        ecodes.KEY_H: 'H',
-        ecodes.KEY_ENTER: 'CONTINUE',
-        ecodes.KEY_KPENTER: 'CONTINUE',
-        # Some keyboards expose KEY_LEFT/RIGHT as KEY_KP4/6 or other codes; add common ones here if needed.
-    }
-
-# ---------------- Evdev-backed input driver ----------------
-if _HAVE_EVDEV:
-    class EvdevInput:
-        def __init__(self, device_paths=None):
-            self.devices = []
-            self.fd_map = {}
-            if device_paths:
-                for p in device_paths:
-                    try:
-                        d = InputDevice(p); self.devices.append(d)
-                    except Exception:
-                        pass
-            else:
-                for dev_path in list_devices():
-                    try:
-                        d = InputDevice(dev_path)
-                        caps = d.capabilities()
-                        if hasattr(caps, '__contains__') and ecodes.EV_KEY in caps:
-                            self.devices.append(d)
-                    except Exception:
-                        pass
-            self.fd_map = {d.fd: d for d in self.devices}
-
-        def poll(self, timeout=0.0):
-            if not self.fd_map: return []
+        # native evdev if wrapper not present
+        self.native_fd_map = {}
+        self.native_map = {}
+        if self.wrapper is None and self.prefer_evdev:
             try:
-                r, _, _ = select.select(list(self.fd_map.keys()), [], [], timeout)
+                from evdev import InputDevice, list_devices, ecodes
+                CODE_TO_TOKEN = {
+                    ecodes.KEY_LEFT:'LEFT', ecodes.KEY_RIGHT:'RIGHT',
+                    ecodes.KEY_UP:'UP', ecodes.KEY_DOWN:'DOWN',
+                    ecodes.KEY_Z:'Z', ecodes.KEY_SPACE:'SPACE',
+                    ecodes.KEY_R:'R', ecodes.KEY_Q:'Q',
+                    ecodes.KEY_A:'A', ecodes.KEY_D:'D', ecodes.KEY_H:'H',
+                    ecodes.KEY_ENTER:'CONTINUE', getattr(ecodes,'KEY_M',None):'M'
+                }
+                CODE_TO_TOKEN = {k:v for k,v in CODE_TO_TOKEN.items() if k is not None}
+                devs=[]
+                for p in list_devices():
+                    try:
+                        d = InputDevice(p)
+                        caps=d.capabilities()
+                        if hasattr(caps,'__contains__') and ecodes.EV_KEY in caps:
+                            devs.append(d)
+                    except Exception:
+                        pass
+                self.native_fd_map = {d.fd:d for d in devs}
+                self.native_map = CODE_TO_TOKEN
             except Exception:
-                return []
-            events = []
-            for fd in r:
-                dev = self.fd_map.get(fd)
-                if not dev: continue
-                try:
-                    for ev in dev.read():
-                        # ev.type == ecodes.EV_KEY (integer 1)
-                        if ev.type == ecodes.EV_KEY:
-                            token = _ECODE_TO_TOKEN.get(ev.code)
-                            if token:
-                                # ev.value: 1=down, 0=up, 2=hold
-                                events.append((token, int(ev.value)))
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except Exception:
-                    continue
-            return events
+                self.native_fd_map = {}; self.native_map = {}
 
-        def close(self):
-            for d in self.devices:
-                try: d.close()
+        # termios fallback
+        self.term_mode = False; self.stdin_fd = None; self._term_saved = None
+        if not self.wrapper and not self.native_fd_map:
+            try:
+                import tty, termios
+                self.stdin_fd = None
+                # Termios driver uses evdev_input.TermiosInput via import when game asks wrapper — but keep flag here
+                self.term_mode = True
+            except Exception:
+                self.term_mode = False
+
+        # canonical token map
+        self.token_map = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
+                          'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','Z':'JUMP','H':'LEFT'}
+
+    def _poll_native(self, timeout=0.0):
+        if not self.native_fd_map: return []
+        try:
+            r,_,_ = select.select(list(self.native_fd_map.keys()), [], [], timeout)
+        except Exception:
+            return []
+        out=[]
+        for fd in r:
+            d=self.native_fd_map.get(fd)
+            if not d: continue
+            try:
+                for ev in d.read():
+                    if ev.type == 1:
+                        token=self.native_map.get(ev.code)
+                        if token: out.append((token,int(ev.value)))
+            except (BlockingIOError, InterruptedError):
+                continue
+            except Exception:
+                continue
+        return out
+
+    def _poll_wrapper(self, timeout=0.0):
+        try:
+            if self.wrapper: return self.wrapper.poll(timeout)
+        except Exception:
+            pass
+        return []
+
+    def _poll_term(self, timeout=0.0):
+        # call into wrapper's TermiosInput if it's present, else nothing
+        try:
+            import evdev_input
+            # evdev_input.open_input will pick termios or evdev depending on env; but we already tried wrapper earlier.
+            # If there's no wrapper object, create a temporary TermiosInput and poll it.
+            if hasattr(evdev_input, "TermiosInput"):
+                t = evdev_input.TermiosInput()
+                evs = t.poll(timeout)
+                t.close()
+                return evs
+        except Exception:
+            pass
+        return []
+
+    def update(self, stdscr):
+        evs=[]
+        if self.wrapper:
+            evs += self._poll_wrapper(0.0)
+        elif self.native_fd_map:
+            evs += self._poll_native(0.0)
+        elif self.term_mode:
+            evs += self._poll_term(0.0)
+
+        now = time.time()
+        for t,v in evs:
+            mapped = self.token_map.get(t) or self.token_map.get(str(t).upper())
+            if not mapped: continue
+            if v == 1:
+                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
+            elif v == 0:
+                self.ev_state[mapped] = False
+                if mapped in self._last_seen: del self._last_seen[mapped]
+            elif v == 2:
+                self.pressed.add(mapped); self.ev_state[mapped] = True; self._last_seen[mapped] = now
+
+        # For termios fallback: synthesize per-frame pressed events for held keys so was('JUMP') fires every frame
+        if self.term_mode or (self.wrapper is None and not self.native_fd_map):
+            for k,held in list(self.ev_state.items()):
+                if held:
+                    self.pressed.add(k)
+                    self._last_seen[k] = now
+
+        # decay holds when we haven't seen a press (only for term-style input)
+        if self.term_mode:
+            cutoff = now - self._hold_timeout
+            stale = [k for k,t in self._last_seen.items() if t < cutoff]
+            for k in stale:
+                self.ev_state[k] = False
+                del self._last_seen[k]
+
+        # always consume curses getch to allow menu keys to work
+        curses_keys = {k: False for k in self.keys}
+        try:
+            while True:
+                k = stdscr.getch()
+                if k == -1: break
+                n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP',
+                     ord('r'):'RESET', ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT',
+                     ord('m'):'MENU', ord('M'):'MENU', ord('\n'):'CONTINUE', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
+                if n:
+                    curses_keys[n] = True
+                    self.pressed.add(n)
+                    if n == 'JUMP':
+                        curses_keys['CONTINUE'] = True; self.pressed.add('CONTINUE')
+        except Exception:
+            pass
+
+        # finalize combined state
+        for k in self.keys:
+            self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
+
+    def was(self,k): return k in self.pressed
+    def down(self,k): return bool(self.keys.get(k, False))
+    def clear(self): self.pressed.clear()
+    def reset(self):
+        for kk in self.keys: self.keys[kk]=False; self.ev_state[kk]=False
+        self.pressed.clear(); self._last_seen.clear()
+    def stop(self):
+        try:
+            if self.wrapper:
+                try: self.wrapper.close()
                 except: pass
-
-# ---------------- Termios (stdin) fallback driver ----------------
-class TermiosInput:
-    def __init__(self):
-        import tty, termios
-        self._fd = sys.stdin.fileno()
-        self._termios = termios
-        self._old_attrs = termios.tcgetattr(self._fd)
-        try:
-            tty.setcbreak(self._fd)
+            if getattr(self, "native_fd_map", None):
+                for d in list(self.native_fd_map.values()):
+                    try: d.close()
+                    except: pass
         except Exception:
             pass
-        self._buf = ""
-        self._seq_map = {
-            "\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
-        }
-        self._char_map = {
-            "a":"A","A":"A","d":"D","D":"D","h":"H","H":"H","z":"Z","Z":"Z",
-            " ":"SPACE","\r":"CONTINUE","\n":"CONTINUE","\x0d":"CONTINUE",
-            "q":"Q","Q":"Q","m":"M","M":"M","r":"R","R":"R",
-        }
-
-    def _read_available(self):
-        try:
-            r,_,_ = select.select([sys.stdin], [], [], 0)
-        except Exception:
-            return ""
-        if not r: return ""
-        try:
-            return os.read(self._fd, 32).decode("utf-8", errors="ignore")
-        except Exception:
-            try:
-                return sys.stdin.read(1)
-            except Exception:
-                return ""
-
-    def poll(self, timeout=0.0):
-        events = []
-        end = time.time() + float(timeout or 0.0)
-        s = self._read_available()
-        if s: self._buf += s
-        while time.time() < end:
-            s = self._read_available()
-            if not s: break
-            self._buf += s
-        while self._buf:
-            if self._buf.startswith("\x1b[") and len(self._buf) >= 3:
-                seq = self._buf[:3]; token = self._seq_map.get(seq)
-                if token:
-                    events.append((token, 1)); self._buf = self._buf[3:]; continue
-            ch = self._buf[0]; self._buf = self._buf[1:]
-            token = self._char_map.get(ch)
-            if token: events.append((token, 1))
-        return events
-
-    def close(self):
-        try:
-            self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_attrs)
-        except Exception:
-            pass
-
-# ---------------- Helper factory ----------------
-def open_input(prefer_evdev=True, device_paths=None):
-    """
-    Returns an input driver instance.
-    prefer_evdev: if True, attempt to use evdev; if unavailable, fall back to termios.
-    """
-    if _HAVE_EVDEV and prefer_evdev:
-        try:
-            drv = EvdevInput(device_paths=device_paths)
-            if getattr(drv, "devices", None):
-                return drv
-            # if no devices, fall back to termios
-            return TermiosInput()
-        except Exception:
-            try: return TermiosInput()
-            except Exception: raise
-    else:
-        return TermiosInput()
-
+        # termios cleanup handled by TermiosInput.close() if used via wrapper
