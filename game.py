@@ -206,14 +206,15 @@ class X11Input:
         return pressed
 
 # --- INPUT ENGINE ---
+# --- INPUT ENGINE (REPLACE EXISTING InputEngine CLASS WITH THIS) ---
 class InputEngine:
     def __init__(self, honor_env=True, hold_timeout=0.6):
         # keys: LIVE booleans, pressed: events (one-shot)
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
         self.pressed = set()
-        self.ev_state = {k: False for k in self.keys}
-        self._last_seen = {}
-        self._hold_timeout = float(hold_timeout)
+        self.ev_state = {k: False for k in self.keys}   # boolean current state per token
+        self._last_seen = {}                            # last timestamp we observed a key for termios
+        self._hold_timeout = float(hold_timeout)        # how long to keep a key considered "held" for termios (s)
 
         # Priority 1: Wrapper (Specific HW)
         self.wrapper = None
@@ -271,11 +272,12 @@ class InputEngine:
                 self._term_saved = termios.tcgetattr(self.stdin_fd)
                 tty.setcbreak(self.stdin_fd)
                 self.term_mode = True
-            except:
+            except Exception:
                 self.term_mode = False
         if self.term_mode:
             print("InputEngine: using termios stdin fallback", file=sys.stderr)
 
+        # Mapping from raw token names to in-game tokens
         self.token_map = {
             'LEFT':'LEFT', 'RIGHT':'RIGHT', 'UP':'JUMP', 'DOWN':'DOWN',
             'SPACE':'JUMP', 'ENTER':'CONTINUE', 'CONTINUE':'CONTINUE',
@@ -283,102 +285,151 @@ class InputEngine:
             'W':'JUMP', 'S':'DOWN', 'Z':'JUMP', 'H':'LEFT'
         }
 
+    # unified event application (makes initial downs create a one-shot pressed event)
+    def _apply_event(self, raw_token, value):
+        """Apply a low-level event token (raw_token) with value (0=up, 1=down).
+        This normalizes tokens using token_map and updates pressed/ev_state.
+        """
+        mapped = self.token_map.get(raw_token)
+        if not mapped:
+            return
+        prev = bool(self.ev_state.get(mapped, False))
+        if value == 1:
+            # keydown
+            if not prev:
+                # first transition -> one-shot pressed event (used for jump)
+                self.pressed.add(mapped)
+            self.ev_state[mapped] = True
+            # update last-seen for termios synthetic hold tracking
+            self._last_seen[mapped] = time.time()
+        elif value == 0:
+            # keyup
+            self.ev_state[mapped] = False
+            if mapped in self._last_seen:
+                try: del self._last_seen[mapped]
+                except: pass
+
     def update(self, stdscr):
-        evs = []
-        # 1. Wrapper
+        # Clear per-frame low-level events; we only keep the one-shot 'pressed' set until clear()
+        # 1) Wrapper (already returns events like evdev)
         if self.wrapper:
             try:
                 evs = self.wrapper.poll(0.0)
-            except:
+            except Exception:
                 evs = []
             for t, v in evs:
-                mapped = self.token_map.get(t)
-                if mapped:
-                    if v == 1:
-                        self.pressed.add(mapped)
-                        self.ev_state[mapped] = True
-                    elif v == 0:
-                        self.ev_state[mapped] = False
+                self._apply_event(t, v)
 
-        # 2. Native Evdev
+        # 2) Native evdev
         elif self.native_fd_map:
             try:
                 r, _, _ = select.select(self.native_fd_map.keys(), [], [], 0.0)
                 for fd in r:
                     for ev in self.native_fd_map[fd].read():
-                        if ev.type == 1:
+                        if ev.type == 1:  # EV_KEY
                             t = self.native_map.get(ev.code)
-                            mapped = self.token_map.get(t)
-                            if mapped:
-                                if ev.value == 1:
-                                    self.pressed.add(mapped)
-                                    self.ev_state[mapped] = True
-                                elif ev.value == 0:
-                                    self.ev_state[mapped] = False
-            except:
+                            if t:
+                                # ev.value: 0=up,1=down,2=repeat
+                                v = 1 if ev.value == 1 else 0
+                                self._apply_event(t, v)
+            except Exception:
                 pass
 
-        # 3. X11 (State Based)
+        # 3) X11: state-based queries -> produce down/up events on transitions
         elif self.x11:
             try:
-                curr = set(self.x11.get_pressed())
-                for t in curr:
-                    mapped = self.token_map.get(t)
-                    if mapped:
-                        self.ev_state[mapped] = True
-                        if t not in self.x11_prev:
-                            self.pressed.add(mapped)
-                # handle releases
-                for t in self.x11_prev:
-                    if t not in curr:
-                        mapped = self.token_map.get(t)
-                        if mapped:
-                            self.ev_state[mapped] = False
+                curr = set(self.x11.get_pressed())  # raw token names like 'LEFT', 'W', etc.
+                # keydown events
+                for t in (curr - self.x11_prev):
+                    self._apply_event(t, 1)
+                # keyup events
+                for t in (self.x11_prev - curr):
+                    self._apply_event(t, 0)
+                # remember previous for next frame
                 self.x11_prev = curr
-            except:
-                # If X11 fails mid-game, just ignore
+            except Exception:
                 pass
 
-        # 4. Termios (Fallback)
+        # 4) Termios fallback: read raw chars and translate -> create down events on first see,
+        # keep keys marked as held until timeout or explicit release inferred.
         elif self.term_mode:
             try:
                 r, _, _ = select.select([self.stdin_fd], [], [], 0.0)
-            except:
+            except Exception:
                 r = []
             if r:
                 try:
-                    data = os.read(self.stdin_fd, 64).decode(errors='ignore')
-                    for ch in data:
-                        t = None
-                        if ch.upper() == 'A': t = 'A'
-                        elif ch.upper() == 'D': t = 'D'
-                        elif ch.upper() == 'W': t = 'W'
-                        elif ch.upper() == 'Z': t = 'Z'
-                        elif ch == ' ': t = 'SPACE'
-                        elif ch in '\r\n': t = 'CONTINUE'
-                        elif ch.upper() == 'R': t = 'R'
-                        elif ch.upper() == 'Q': t = 'Q'
-                        elif ch.upper() == 'M': t = 'M'
-                        mapped = self.token_map.get(t)
-                        if mapped:
-                            self.pressed.add(mapped)
-                            self.ev_state[mapped] = True
-                            self._last_seen[mapped] = time.time()
-                except:
-                    pass
-            # decay holds
+                    data = os.read(self.stdin_fd, 256).decode(errors='ignore')
+                except Exception:
+                    data = ""
+                # parse characters (common single char mappings)
+                for ch in data:
+                    raw = None
+                    if ch == '\x1b':
+                        # potential escape sequences for arrows - try to read more (non-blocking)
+                        # attempt to read extra bytes (if any)
+                        try:
+                            peek = os.read(self.stdin_fd, 8).decode(errors='ignore')
+                            seq = ch + peek
+                        except Exception:
+                            seq = ch
+                        # arrow sequences
+                        if seq.startswith("\x1b[A"):
+                            raw = "UP"
+                        elif seq.startswith("\x1b[B"):
+                            raw = "DOWN"
+                        elif seq.startswith("\x1b[C"):
+                            raw = "RIGHT"
+                        elif seq.startswith("\x1b[D"):
+                            raw = "LEFT"
+                        else:
+                            # ignore unknown escape
+                            raw = None
+                    else:
+                        # plain chars
+                        if ch.upper() == 'A': raw = 'A'
+                        elif ch.upper() == 'D': raw = 'D'
+                        elif ch.upper() == 'W': raw = 'W'
+                        elif ch.upper() == 'Z': raw = 'Z'
+                        elif ch == ' ': raw = 'SPACE'
+                        elif ch in '\r\n': raw = 'CONTINUE'
+                        elif ch.upper() == 'R': raw = 'R'
+                        elif ch.upper() == 'Q': raw = 'Q'
+                        elif ch.upper() == 'M': raw = 'M'
+                    if raw:
+                        # create a down event if it wasn't already held
+                        mapped = self.token_map.get(raw)
+                        already = bool(self.ev_state.get(mapped, False))
+                        self._apply_event(raw, 1)
+                        # keep timestamp (makes hold stable across OS initial repeat gap)
+                        self._last_seen[self.token_map.get(raw)] = time.time()
+
+            # now, simulate releases for keys we haven't seen for a while
             now = time.time()
-            for k, t in list(self._last_seen.items()):
-                if now - t > self._hold_timeout:
-                    self.ev_state[k] = False
-                    del self._last_seen[k]
+            to_clear = []
+            for k, ts in list(self._last_seen.items()):
+                if now - ts > self._hold_timeout:
+                    # consider it released
+                    to_clear.append(k)
+            for k in to_clear:
+                # emit a synthetic key-up
+                # k is already mapped token (LEFT, RIGHT, JUMP, etc.) so reverse-lookup raw not needed
+                # call _apply_event with the raw name that maps to k: find first raw whose token_map == k
+                raw_equiv = None
+                for raw, mapped in self.token_map.items():
+                    if mapped == k:
+                        raw_equiv = raw
+                        break
+                if raw_equiv:
+                    self._apply_event(raw_equiv, 0)
 
         # Curses Menu Fallback (Always check for basic menu nav)
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
                 k = stdscr.getch()
-                if k == -1: break
+                if k == -1:
+                    break
                 n = {
                     curses.KEY_LEFT: 'LEFT', curses.KEY_RIGHT: 'RIGHT',
                     ord(' '): 'JUMP', ord('r'): 'RESET', ord('R'): 'RESET',
@@ -387,13 +438,16 @@ class InputEngine:
                 }.get(k)
                 if n:
                     curses_keys[n] = True
-                    self.pressed.add(n)
-        except:
+                    # treat curses nav keys as immediate down transitions
+                    self._apply_event(n, 1)
+        except Exception:
             pass
 
+        # Finally, update the public keys[] states (used by movement / continuous reads).
         for k in self.keys:
-            self.keys[k] = self.ev_state.get(k, False) or curses_keys.get(k, False)
+            self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
+    # helpers the rest of your code expects
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
@@ -407,10 +461,14 @@ class InputEngine:
 
     def stop(self):
         if self.x11:
-            self.x11.close()
+            try: self.x11.close()
+            except: pass
         if self.term_mode and self._term_saved:
             import termios
-            termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
+            try:
+                termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
+            except Exception:
+                pass
 
 # --- PHYSICS OBJECTS ---
 class Platform:
