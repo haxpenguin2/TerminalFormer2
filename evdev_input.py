@@ -7,7 +7,7 @@ Strategies:
 3. Termios: Stdin fallback (Universal, but suffers from OS repeat delay).
 """
 import select, os, sys, time, ctypes
-from ctypes import cdll, create_string_buffer
+from ctypes import cdll, create_string_buffer, c_char_p
 
 # ---------------- 1. Evdev Driver (Native Linux) ----------------
 _HAVE_EVDEV = True
@@ -54,7 +54,8 @@ class EvdevInput:
                         token = _EVDEV_MAPPING.get(ev.code)
                         if token and ev.value < 2: # 0=Up, 1=Down, 2=Repeat (ignore 2)
                             events.append((token, int(ev.value)))
-        except Exception: return []
+        except Exception:
+            return []
         return events
 
     def close(self):
@@ -79,7 +80,6 @@ class X11Input:
         self._last_state = set()
 
         # Hardcoded X11 Keycodes (Works on most Standard US Layouts)
-        # Scan code + 8 = X11 Keycode usually.
         self.keymap = {
             111: 'UP',    116: 'DOWN',  113: 'LEFT',  114: 'RIGHT', # Arrows
             25:  'UP',    38:  'LEFT',  39:  'DOWN',  40:  'RIGHT', # WASD
@@ -87,10 +87,16 @@ class X11Input:
         }
 
     def poll(self, timeout=0.0):
-        # Prepare a 32-byte buffer for the key vector
-        keys_return = create_string_buffer(32)
-        # Query the hardware state
-        self.x11.XQueryKeymap(self.disp, keys_return)
+        # Use unsigned byte array for portability
+        KeysArray = ctypes.c_ubyte * 32
+        keys_return = KeysArray()
+        try:
+            self.x11.XQueryKeymap(self.disp, ctypes.cast(keys_return, c_char_p))
+        except Exception:
+            # fallback
+            buf = create_string_buffer(32)
+            self.x11.XQueryKeymap(self.disp, buf)
+            keys_return = buf
 
         current_state = set()
         events = []
@@ -99,8 +105,10 @@ class X11Input:
         for code, token in self.keymap.items():
             byte_index = code // 8
             bit_index = code % 8
-            # Check if the bit is set
-            is_down = (ord(keys_return[byte_index]) & (1 << bit_index)) != 0
+            try:
+                is_down = (keys_return[byte_index] & (1 << bit_index)) != 0
+            except Exception:
+                is_down = False
 
             if is_down:
                 current_state.add(token)
@@ -123,7 +131,10 @@ class X11Input:
 
     def close(self):
         if hasattr(self, 'disp') and self.disp:
-            self.x11.XCloseDisplay(self.disp)
+            try:
+                self.x11.XCloseDisplay(self.disp)
+            except:
+                pass
 
 # ---------------- 3. Termios Driver (Fallback) ----------------
 class TermiosInput:
@@ -136,8 +147,8 @@ class TermiosInput:
 
         self._buf = ""
         self._held_keys = {} # token -> timestamp
-        # Timeout to consider a key released (approx 2-3 frames at 60fps)
-        self._release_timeout = 0.05
+        # Timeout to consider a key released (seconds)
+        self._release_timeout = 0.12
 
         self.maps = {
             "\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
@@ -171,17 +182,15 @@ class TermiosInput:
                 self._buf = self._buf[1:] # discard unknown
 
         # 3. Simulate Key Up events based on timeout
-        # If we haven't seen the char in X seconds, assume user let go.
-        # Note: This is imperfect. It can't bridge the initial OS delay gap (500ms),
-        # but it handles rapid repeat well.
         released = []
-        for token, ts in self._held_keys.items():
+        for token, ts in list(self._held_keys.items()):
             if cur_time - ts > self._release_timeout:
                 events.append((token, 0))
                 released.append(token)
 
         for r in released:
-            del self._held_keys[r]
+            try: del self._held_keys[r]
+            except: pass
 
         return events
 
@@ -196,8 +205,11 @@ def open_input():
         try:
             print("Input: Trying Evdev...", file=sys.stderr)
             drv = EvdevInput()
-            if drv.devices: return drv
-        except: pass
+            if drv.devices:
+                print("Input: Evdev ready (devices found).", file=sys.stderr)
+                return drv
+        except Exception as e:
+            print("Input: Evdev failed:", e, file=sys.stderr)
 
     # Priority 2: X11 Direct (Crostini / Desktop)
     try:
@@ -206,7 +218,7 @@ def open_input():
             print("Input: Trying X11...", file=sys.stderr)
             return X11Input()
     except Exception as e:
-        pass
+        print("Input: X11 attempt failed:", e, file=sys.stderr)
 
     # Priority 3: Termios (Stdin fallback)
     print("Input: Fallback to Termios...", file=sys.stderr)
@@ -215,7 +227,7 @@ def open_input():
 # ---------------- Test Code ----------------
 if __name__ == "__main__":
     inp = open_input()
-    print("Running... Press 'Q' to quit.")
+    print("Running... Press 'Q' to quit.", file=sys.stderr)
     try:
         while True:
             evs = inp.poll(timeout=0.016) # ~60 FPS poll rate
@@ -226,4 +238,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        inp.close()
+        try: inp.close()
+        except: pass
+
