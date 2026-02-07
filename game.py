@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# game.py - TerminalFormer2 (Fixed & Formatted for Chromebook input)
-# Features: Low-Latency X11 Input, Save States, Plugins, Physics
+# game.py - TerminalFormer2 (Chromebook-friendly input + small optimizations)
 import curses
 import time
 import os
@@ -13,7 +12,7 @@ import select
 import ctypes
 import locale
 from collections import deque
-from ctypes import c_void_p, c_char_p, c_int, c_uint, c_ulong, create_string_buffer
+from ctypes import c_void_p, c_char_p, c_uint, create_string_buffer, c_ubyte
 
 # --- CONFIG ---
 GRAVITY = 90.0
@@ -89,7 +88,6 @@ def save_score(cat, val, name="Player"):
         pass
 
     entries = data.get(cat, [])
-    # Normalize old data
     entries = [{"name": "UNK", "time": x} if isinstance(x, (int, float)) else x for x in entries]
     entries.append({"name": name, "time": val})
     entries.sort(key=lambda x: x["time"])
@@ -131,7 +129,7 @@ def clear_slot(path):
     except:
         pass
 
-# --- X11 INPUT HELPER ---
+# --- X11 INPUT HELPER (robust) ---
 class X11Input:
     """Directly queries X11 server for key state. Zero delay, no repeat lag."""
     def __init__(self):
@@ -140,10 +138,11 @@ class X11Input:
         self.keycodes = {}
         try:
             self.lib = ctypes.CDLL('libX11.so.6')
+            # prototypes
             self.lib.XOpenDisplay.argtypes = [c_char_p]
             self.lib.XOpenDisplay.restype = c_void_p
             self.lib.XQueryKeymap.argtypes = [c_void_p, c_char_p]
-            self.lib.XKeysymToKeycode.argtypes = [c_void_p, c_ulong]
+            self.lib.XKeysymToKeycode.argtypes = [c_void_p, c_uint]
             self.lib.XKeysymToKeycode.restype = c_uint
             self.lib.XCloseDisplay.argtypes = [c_void_p]
 
@@ -151,7 +150,7 @@ class X11Input:
             if not self.display:
                 raise Exception("No X11 Display")
 
-            # Map standard X11 KeySyms to tokens
+            # Use common keysyms (hex constants) and map to readable tokens
             syms = {
                 'LEFT': 0xFF51, 'RIGHT': 0xFF53, 'UP': 0xFF52, 'DOWN': 0xFF54,
                 'SPACE': 0x0020, 'Q': 0x0071, 'R': 0x0072, 'M': 0x006D,
@@ -159,9 +158,13 @@ class X11Input:
                 'W': 0x0077, 'A': 0x0061, 'S': 0x0073, 'D': 0x0064, 'Z': 0x007a
             }
             for name, sym in syms.items():
-                code = self.lib.XKeysymToKeycode(self.display, sym)
-                if code != 0:
-                    self.keycodes[name] = code
+                try:
+                    code = self.lib.XKeysymToKeycode(self.display, sym)
+                except Exception:
+                    code = 0
+                if code:
+                    # store numeric keycode (uses X keycode space)
+                    self.keycodes[name] = int(code)
         except Exception:
             self.close()
             raise
@@ -175,48 +178,51 @@ class X11Input:
         self.display = None
 
     def get_pressed(self):
+        """Return set of token names currently down according to XQueryKeymap."""
         if not self.display:
-            return []
-        # Use an unsigned byte array so indexing yields integers (py3-friendly)
-        KeysArray = ctypes.c_ubyte * 32
+            return set()
+        # c_ubyte array yields ints when indexed (py3-friendly)
+        KeysArray = c_ubyte * 32
         keys = KeysArray()
-        # XQueryKeymap expects a char*; cast our array
+        # call XQueryKeymap with pointer to our array
         try:
             self.lib.XQueryKeymap(self.display, ctypes.cast(keys, c_char_p))
         except Exception:
-            # If cast fails, try the safer create_string_buffer fallback
+            # fallback to create_string_buffer if casting fails
             buf = create_string_buffer(32)
-            self.lib.XQueryKeymap(self.display, buf)
-            pressed = []
+            try:
+                self.lib.XQueryKeymap(self.display, buf)
+            except Exception:
+                return set()
+            # interpret buf as bytes
+            pressed = set()
             for name, code in self.keycodes.items():
                 byte_idx = code // 8
                 bit_idx = code % 8
                 if byte_idx < 32:
                     if (buf[byte_idx] & (1 << bit_idx)) != 0:
-                        pressed.append(name)
+                        pressed.add(name)
             return pressed
 
-        pressed = []
+        pressed = set()
         for name, code in self.keycodes.items():
             byte_idx = code // 8
             bit_idx = code % 8
             if byte_idx < 32:
                 if (keys[byte_idx] & (1 << bit_idx)) != 0:
-                    pressed.append(name)
+                    pressed.add(name)
         return pressed
 
-# --- INPUT ENGINE ---
-# --- INPUT ENGINE (REPLACE EXISTING InputEngine CLASS WITH THIS) ---
+# --- INPUT ENGINE (unified, evdev-like behavior) ---
 class InputEngine:
     def __init__(self, honor_env=True, hold_timeout=0.6):
-        # keys: LIVE booleans, pressed: events (one-shot)
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
-        self.pressed = set()
-        self.ev_state = {k: False for k in self.keys}   # boolean current state per token
-        self._last_seen = {}                            # last timestamp we observed a key for termios
-        self._hold_timeout = float(hold_timeout)        # how long to keep a key considered "held" for termios (s)
+        self.pressed = set()                 # one-shot pressed tokens (consumed by clear())
+        self.ev_state = {k: False for k in self.keys}  # boolean current state per token
+        self._last_seen = {}                 # for termios: last time we observed token
+        self._hold_timeout = float(hold_timeout)
 
-        # Priority 1: Wrapper (Specific HW)
+        # 1) wrapper (if provided)
         self.wrapper = None
         try:
             import evdev_input as evw
@@ -226,7 +232,7 @@ class InputEngine:
         if self.wrapper:
             print("InputEngine: using Wrapper/EvdevInput wrapper", file=sys.stderr)
 
-        # Priority 2: Native Evdev (Linux /dev/input - requires root/permissions)
+        # 2) native evdev (/dev/input)
         self.native_fd_map = {}
         self.native_map = {}
         if not self.wrapper:
@@ -238,9 +244,9 @@ class InputEngine:
                     self.native_map = {
                         ecodes.KEY_LEFT: 'LEFT', ecodes.KEY_RIGHT: 'RIGHT',
                         ecodes.KEY_UP: 'UP', ecodes.KEY_DOWN: 'DOWN',
+                        ecodes.KEY_W: 'W', ecodes.KEY_A: 'A', ecodes.KEY_S: 'S', ecodes.KEY_D: 'D',
                         ecodes.KEY_Z: 'Z', ecodes.KEY_SPACE: 'SPACE',
                         ecodes.KEY_R: 'R', ecodes.KEY_Q: 'Q',
-                        ecodes.KEY_A: 'A', ecodes.KEY_D: 'D',
                         ecodes.KEY_H: 'H', ecodes.KEY_ENTER: 'CONTINUE',
                         ecodes.KEY_M: 'M'
                     }
@@ -249,7 +255,7 @@ class InputEngine:
         if self.native_fd_map:
             print("InputEngine: using native evdev (/dev/input) devices", file=sys.stderr)
 
-        # Priority 3: X11 Direct (Best for Chromebook/Desktop without root)
+        # 3) X11 polling
         self.x11 = None
         self.x11_prev = set()
         if not self.wrapper and not self.native_fd_map:
@@ -260,14 +266,13 @@ class InputEngine:
         if self.x11:
             print("InputEngine: using X11 direct polling (XQueryKeymap)", file=sys.stderr)
 
-        # Priority 4: Termios (Fallback)
+        # 4) termios fallback
         self.term_mode = False
         self.stdin_fd = None
         self._term_saved = None
         if not self.wrapper and not self.native_fd_map and not self.x11:
             try:
-                import tty
-                import termios
+                import tty, termios
                 self.stdin_fd = sys.stdin.fileno()
                 self._term_saved = termios.tcgetattr(self.stdin_fd)
                 tty.setcbreak(self.stdin_fd)
@@ -277,81 +282,74 @@ class InputEngine:
         if self.term_mode:
             print("InputEngine: using termios stdin fallback", file=sys.stderr)
 
-        # Mapping from raw token names to in-game tokens
+        # mapping raw tokens -> in-game tokens
         self.token_map = {
-            'LEFT':'LEFT', 'RIGHT':'RIGHT', 'UP':'JUMP', 'DOWN':'DOWN',
-            'SPACE':'JUMP', 'ENTER':'CONTINUE', 'CONTINUE':'CONTINUE',
-            'R':'RESET', 'Q':'QUIT', 'M':'MENU', 'A':'LEFT', 'D':'RIGHT',
-            'W':'JUMP', 'S':'DOWN', 'Z':'JUMP', 'H':'LEFT'
+            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
+            'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
+            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT','W':'JUMP'
         }
 
-    # unified event application (makes initial downs create a one-shot pressed event)
     def _apply_event(self, raw_token, value):
-        """Apply a low-level event token (raw_token) with value (0=up, 1=down).
-        This normalizes tokens using token_map and updates pressed/ev_state.
+        """Normalize raw token and update state.
+        value: 1=down, 0=up. Produces a one-shot pressed() on first-down only.
         """
         mapped = self.token_map.get(raw_token)
         if not mapped:
             return
         prev = bool(self.ev_state.get(mapped, False))
         if value == 1:
-            # keydown
             if not prev:
-                # first transition -> one-shot pressed event (used for jump)
                 self.pressed.add(mapped)
             self.ev_state[mapped] = True
-            # update last-seen for termios synthetic hold tracking
             self._last_seen[mapped] = time.time()
-        elif value == 0:
-            # keyup
+        else:
             self.ev_state[mapped] = False
             if mapped in self._last_seen:
-                try: del self._last_seen[mapped]
-                except: pass
+                del self._last_seen[mapped]
 
     def update(self, stdscr):
-        # Clear per-frame low-level events; we only keep the one-shot 'pressed' set until clear()
-        # 1) Wrapper (already returns events like evdev)
+        # Wrapper
         if self.wrapper:
             try:
                 evs = self.wrapper.poll(0.0)
             except Exception:
                 evs = []
             for t, v in evs:
-                self._apply_event(t, v)
+                # evdev: v==2 is repeat; treat as held
+                v2 = 1 if v == 1 else 0
+                self._apply_event(t, v2)
 
-        # 2) Native evdev
+        # Native evdev
         elif self.native_fd_map:
             try:
-                r, _, _ = select.select(self.native_fd_map.keys(), [], [], 0.0)
+                r, _, _ = select.select(list(self.native_fd_map.keys()), [], [], 0.0)
                 for fd in r:
-                    for ev in self.native_fd_map[fd].read():
+                    dev = self.native_fd_map.get(fd)
+                    for ev in dev.read():
                         if ev.type == 1:  # EV_KEY
-                            t = self.native_map.get(ev.code)
-                            if t:
-                                # ev.value: 0=up,1=down,2=repeat
-                                v = 1 if ev.value == 1 else 0
-                                self._apply_event(t, v)
+                            raw = self.native_map.get(ev.code)
+                            if raw:
+                                v2 = 1 if ev.value == 1 else 0
+                                self._apply_event(raw, v2)
             except Exception:
                 pass
 
-        # 3) X11: state-based queries -> produce down/up events on transitions
+        # X11 state-based polling
         elif self.x11:
             try:
-                curr = set(self.x11.get_pressed())  # raw token names like 'LEFT', 'W', etc.
-                # keydown events
-                for t in (curr - self.x11_prev):
-                    self._apply_event(t, 1)
-                # keyup events
-                for t in (self.x11_prev - curr):
-                    self._apply_event(t, 0)
-                # remember previous for next frame
+                curr = self.x11.get_pressed()
+                # generate down events for new keys
+                for raw in (curr - self.x11_prev):
+                    self._apply_event(raw, 1)
+                # generate up events for released keys
+                for raw in (self.x11_prev - curr):
+                    self._apply_event(raw, 0)
                 self.x11_prev = curr
             except Exception:
                 pass
 
-        # 4) Termios fallback: read raw chars and translate -> create down events on first see,
-        # keep keys marked as held until timeout or explicit release inferred.
+        # Termios fallback: parse raw bytes and simulate held-state
         elif self.term_mode:
             try:
                 r, _, _ = select.select([self.stdin_fd], [], [], 0.0)
@@ -359,62 +357,50 @@ class InputEngine:
                 r = []
             if r:
                 try:
-                    data = os.read(self.stdin_fd, 256).decode(errors='ignore')
+                    data = os.read(self.stdin_fd, 512).decode(errors='ignore')
                 except Exception:
                     data = ""
-                # parse characters (common single char mappings)
-                for ch in data:
+                i = 0
+                # parse potential escape sequences for arrows
+                while i < len(data):
+                    ch = data[i]
                     raw = None
                     if ch == '\x1b':
-                        # potential escape sequences for arrows - try to read more (non-blocking)
-                        # attempt to read extra bytes (if any)
-                        try:
-                            peek = os.read(self.stdin_fd, 8).decode(errors='ignore')
-                            seq = ch + peek
-                        except Exception:
-                            seq = ch
-                        # arrow sequences
+                        # attempt to read up to 3 bytes for CSI sequences
+                        seq = data[i:i+3]
                         if seq.startswith("\x1b[A"):
                             raw = "UP"
+                            i += 3
                         elif seq.startswith("\x1b[B"):
                             raw = "DOWN"
+                            i += 3
                         elif seq.startswith("\x1b[C"):
                             raw = "RIGHT"
+                            i += 3
                         elif seq.startswith("\x1b[D"):
                             raw = "LEFT"
+                            i += 3
                         else:
-                            # ignore unknown escape
-                            raw = None
+                            i += 1
+                            continue
                     else:
-                        # plain chars
-                        if ch.upper() == 'A': raw = 'A'
-                        elif ch.upper() == 'D': raw = 'D'
-                        elif ch.upper() == 'W': raw = 'W'
-                        elif ch.upper() == 'Z': raw = 'Z'
-                        elif ch == ' ': raw = 'SPACE'
-                        elif ch in '\r\n': raw = 'CONTINUE'
-                        elif ch.upper() == 'R': raw = 'R'
-                        elif ch.upper() == 'Q': raw = 'Q'
-                        elif ch.upper() == 'M': raw = 'M'
+                        if ch == ' ':
+                            raw = 'SPACE'
+                        elif ch in '\r\n':
+                            raw = 'CONTINUE'
+                        else:
+                            uc = ch.upper()
+                            if uc in ('A','D','W','S','Z','R','Q','M','H'):
+                                raw = uc
+                        i += 1
                     if raw:
-                        # create a down event if it wasn't already held
-                        mapped = self.token_map.get(raw)
-                        already = bool(self.ev_state.get(mapped, False))
                         self._apply_event(raw, 1)
-                        # keep timestamp (makes hold stable across OS initial repeat gap)
-                        self._last_seen[self.token_map.get(raw)] = time.time()
 
-            # now, simulate releases for keys we haven't seen for a while
+            # release keys not seen recently
             now = time.time()
-            to_clear = []
-            for k, ts in list(self._last_seen.items()):
-                if now - ts > self._hold_timeout:
-                    # consider it released
-                    to_clear.append(k)
-            for k in to_clear:
-                # emit a synthetic key-up
-                # k is already mapped token (LEFT, RIGHT, JUMP, etc.) so reverse-lookup raw not needed
-                # call _apply_event with the raw name that maps to k: find first raw whose token_map == k
+            to_release = [k for k, ts in self._last_seen.items() if now - ts > self._hold_timeout]
+            for k in to_release:
+                # find a raw token mapping to k and emit up
                 raw_equiv = None
                 for raw, mapped in self.token_map.items():
                     if mapped == k:
@@ -423,7 +409,7 @@ class InputEngine:
                 if raw_equiv:
                     self._apply_event(raw_equiv, 0)
 
-        # Curses Menu Fallback (Always check for basic menu nav)
+        # curses nav fallback (immediate)
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
@@ -438,16 +424,15 @@ class InputEngine:
                 }.get(k)
                 if n:
                     curses_keys[n] = True
-                    # treat curses nav keys as immediate down transitions
                     self._apply_event(n, 1)
         except Exception:
             pass
 
-        # Finally, update the public keys[] states (used by movement / continuous reads).
+        # publish continuous keys[] (movement logic reads these)
         for k in self.keys:
             self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
-    # helpers the rest of your code expects
+    # API expected by the rest of your code
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
@@ -464,8 +449,8 @@ class InputEngine:
             try: self.x11.close()
             except: pass
         if self.term_mode and self._term_saved:
-            import termios
             try:
+                import termios
                 termios.tcsetattr(self.stdin_fd, termios.TCSANOW, self._term_saved)
             except Exception:
                 pass
@@ -486,10 +471,8 @@ class Platform:
         if self.ease == 'SINE':
             off = math.sin(self.t)
         else:
-            # Linear Ping-Pong
             norm = (self.t / math.pi) % 2
             off = norm - 1 if norm > 1 else 1 - norm
-
         self.x = self.ox + (off * (self.lx / 2))
         self.y = self.oy + (off * (self.ly / 2))
 
@@ -500,18 +483,14 @@ class Platform:
 def load_level(path, platform_timers=None):
     if not os.path.exists(path):
         return None, [], "UNKNOWN", {}
-
     with open(path) as f:
         parts = f.read().split("__METADATA__")
-
     lines = [l.rstrip("\r\n") for l in parts[0].strip().split('\n') if l != ""]
     w = max(len(l) for l in lines) if lines else 0
     grid = [list(l.ljust(w, ' ')) for l in lines]
-
     plats = []
     title = os.path.splitext(os.path.basename(path))[0]
     meta = {}
-
     if len(parts) > 1:
         try:
             d = json.loads(parts[1])
@@ -523,7 +502,6 @@ def load_level(path, platform_timers=None):
                     t_start = platform_timers[i] if platform_timers and i < len(platform_timers) else 0.0
                     mp = Platform(p, t_start)
                     plats.append(mp)
-                    # Clear grid under platform defs
                     for j in range(p['w']):
                         gy, gx = int(p['y']), int(p['x']) + j
                         if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]):
@@ -577,10 +555,8 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
     h, w = stdscr.getmaxyx()
     stdscr.erase()
     gh, gw = len(grid), len(grid[0]) if grid else 0
-
     ox = (w - gw) // 2 if gw < w else 0
     oy = (h - gh) // 2 if gh < h else 0
-
     sx = int(max(0, min(cx, max(0, gw - w)))) if gw >= w else 0
     sy = int(max(0, min(cy, max(0, gh - h)))) if gh >= h else 0
 
@@ -623,17 +599,13 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
             stdscr.addstr(0, 0, f"{t_str} \"{ltitle}\"", curses.A_BOLD)
         else:
             stdscr.addstr(0, 1, msg, curses.A_REVERSE | curses.A_BOLD)
-
         t_txt = f"TIME: {time_val:.2f}s"
         stdscr.addstr(0, max(0, w - len(t_txt) - 1), t_txt, curses.A_BOLD)
-        # Debug info
-        # stdscr.addstr(h-1, 0, f"Pos: {int(px)},{int(py)} | FPS: {int(fps)}")
     except:
         pass
-
     stdscr.refresh()
 
-# --- MENUS ---
+# --- MENUS / UI (unchanged aside from minor tidy) ---
 def draw_centered_menu(stdscr, title, opts, selected_idx):
     h, w = stdscr.getmaxyx()
     box_w = max(40, min(60, max(len(title) + 4, max((len(o) + 6) for o in opts))))
@@ -646,12 +618,10 @@ def draw_centered_menu(stdscr, title, opts, selected_idx):
         stdscr.attron(curses.A_BOLD | curses.A_UNDERLINE)
         stdscr.addstr(by, bx + 2, title)
         stdscr.attroff(curses.A_BOLD | curses.A_UNDERLINE)
-
         for i, it in enumerate(opts):
             txt = f"> {it} <" if i == selected_idx else f"   {it}   "
             attr = curses.A_REVERSE if i == selected_idx else curses.A_NORMAL
             stdscr.addstr(by + 2 + i, bx + 2, txt, attr)
-
         stdscr.addstr(by + box_h - 1, bx + 2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM)
         stdscr.refresh()
     except:
@@ -661,10 +631,8 @@ def show_in_game_menu(stdscr, allow_save=True):
     opts = ["Resume"]
     if allow_save:
         opts.extend(["Save & Quit to Menu", "Save Position (Slot)", "Clear Slot Data"])
-
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"
     opts.extend([quit_txt, "Cancel"])
-
     idx = 0
     stdscr.nodelay(False)
     while True:
@@ -694,22 +662,16 @@ def arcade_name_entry(stdscr, total_time):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         cy, cx = h // 2, w // 2
-
         title = "★ CONGRATULATIONS! ★"
         stdscr.addstr(cy - 5, cx - len(title) // 2, title, curses.A_BOLD)
-
         time_str = f"FINAL TIME: {total_time:.2f}s"
         stdscr.addstr(cy - 3, cx - len(time_str) // 2, time_str)
-
         prompt = "ENTER INITIALS:"
         stdscr.addstr(cy - 1, cx - len(prompt) // 2, prompt, curses.A_UNDERLINE)
-
         field_disp = f" {name} " + ("█" if (int(time.time() * 2) % 2) == 0 else " ")
         stdscr.addstr(cy + 1, cx - len(field_disp) // 2, field_disp, curses.A_REVERSE)
-
         stdscr.addstr(cy + 3, cx - 13, "TYPE NAME - ENTER TO SUBMIT", curses.A_DIM)
         stdscr.refresh()
-
         k = stdscr.getch()
         if k in (10, 13):
             return name if len(name) > 0 else "AAA"
@@ -718,16 +680,14 @@ def arcade_name_entry(stdscr, total_time):
         elif 32 <= k <= 126 and len(name) < 10:
             name += chr(k).upper()
 
-# --- MAIN GAME LOGIC ---
+# --- MAIN GAME LOGIC (unchanged aside from using improved input) ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
-
     p_timers = []
     plugin_data = {}
     if resume_state:
          p_timers = resume_state.get("platform_timers", [])
          plugin_data = resume_state.get("plugin_state", {})
-
     grid, plats, title, meta = load_level(level_file, p_timers)
     if not grid:
         return "NO_FILE", 0.0
@@ -740,13 +700,10 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 px, py = x + 0.5, y + 0.5
                 start_cp = (x + 0.5, y + 0.5)
                 grid[y][x] = ' '
-
     if start_cp is None:
         start_cp = (px, py)
-
     vx, vy = 0.0, 0.0
     cp = start_cp
-
     if resume_state:
         try:
             saved_f = resume_state.get("level_file", "")
@@ -768,7 +725,6 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
     cur_t = 0.0
     msg = None
     mend = 0
-
     ap = None
     ap_off = 0.0
     stdscr.nodelay(True)
@@ -783,7 +739,6 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         if inp.was('MENU') or inp.was('QUIT'):
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset + cur_t, level_num, title)
             choice = show_in_game_menu(stdscr, allow_save=allow_save)
-
             if choice in ("RESUME", "CANCEL"):
                 inp.clear()
                 last = time.time()
@@ -869,7 +824,6 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 if ap_off + PHYS['HW'] <= 0 or ap_off - PHYS['HW'] >= ap.w:
                     ap = None
 
-                # Check plugin supports
                 sy = int(py + PHYS['HH'] + 0.05)
                 for lx in {int(px), int(px - PHYS['HW'] + 0.1), int(px + PHYS['HW'] - 0.1)}:
                     if 0 <= sy < len(grid) and 0 <= lx < len(grid[0]):
@@ -912,7 +866,6 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     if vy > 0: # Landing
                         ly = int(math.floor(npy + PHYS['HH']))
                         py, vy = ly - PHYS['HH'] - 0.001, 0
-                        # Plugin support check
                         for lx in {int(px), int(px - PHYS['HW'] + 0.01), int(px + PHYS['HW'] - 0.01)}:
                             if 0 <= ly < len(grid) and 0 <= lx < len(grid[0]):
                                 pmeta = get_plugin(grid[ly][lx])
@@ -1008,37 +961,25 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 # --- ENTRY POINT ---
 def main(stdscr):
     global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
-
-    # Initialize Environment
     locale.setlocale(locale.LC_ALL, '')
     curses.curs_set(0)
-
-    # default hold timeout (seconds) to survive ChromeOS initial repeat delay
     hold_timeout = 0.6
-
     inp = None
     mode, path, tot_t, lvl = "CAMP", "", 0.0, 1
     resume_state = None
-
-    # Args
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--slot" and i + 1 < len(args):
-            SAVE_SLOT_PATH = args[i + 1]
-            i += 2
+            SAVE_SLOT_PATH = args[i + 1]; i += 2
         elif a == "--resume":
-            RESUME_FLAG = True
-            i += 1
+            RESUME_FLAG = True; i += 1
         elif a == "--speedrun":
-            SPEEDRUN_MODE = True
-            i += 1
+            SPEEDRUN_MODE = True; i += 1
         elif a == "--hold-timeout" and i + 1 < len(args):
-            try:
-                hold_timeout = float(args[i+1])
-            except:
-                hold_timeout = 0.6
+            try: hold_timeout = float(args[i+1])
+            except: hold_timeout = 0.6
             i += 2
         else:
             mode, path = "SNGL", a
@@ -1071,19 +1012,16 @@ def main(stdscr):
 
             if not os.path.exists(fpath):
                 if mode == "CAMP" and lvl > 1:
-                    # Campaign Finished
                     if SAVE_SLOT_PATH:
                         if SPEEDRUN_MODE:
                             clear_slot(SAVE_SLOT_PATH)
                         else:
                             save_game_state_to(SAVE_SLOT_PATH, {"level_num": 1, "completed": True})
-
                     if SPEEDRUN_MODE:
                         player_name = arcade_name_entry(stdscr, tot_t)
                         save_score("speedrun_camp", tot_t, player_name)
                     else:
                         save_score("campaign", tot_t, "Player")
-
                     stdscr.erase()
                     stdscr.addstr(curses.LINES // 2, (curses.COLS - 20) // 2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD)
                     stdscr.refresh()
@@ -1096,7 +1034,6 @@ def main(stdscr):
 
             can_save_in_menu = (mode == "CAMP" and not SPEEDRUN_MODE)
             res, el = play_level(stdscr, fpath, inp, lvl, tot_t, resume_state=resume_state, allow_save=can_save_in_menu)
-
             resume_state = None
             if res == "QUIT":
                 return
