@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# game.py - TerminalFormer2 (Fixed & Formatted)
+# game.py - TerminalFormer2 (Fixed & Formatted for Chromebook input)
 # Features: Low-Latency X11 Input, Save States, Plugins, Physics
 import curses
 import time
@@ -70,7 +70,7 @@ def load_plugins():
                     PLUGINS.append(m)
                     if isinstance(ch, str) and len(ch) == 1:
                         REGISTRY[ch] = m
-        except Exception as e:
+        except Exception:
             pass
 
 load_plugins()
@@ -177,19 +177,38 @@ class X11Input:
     def get_pressed(self):
         if not self.display:
             return []
-        keys = create_string_buffer(32)
-        self.lib.XQueryKeymap(self.display, keys)
+        # Use an unsigned byte array so indexing yields integers (py3-friendly)
+        KeysArray = ctypes.c_ubyte * 32
+        keys = KeysArray()
+        # XQueryKeymap expects a char*; cast our array
+        try:
+            self.lib.XQueryKeymap(self.display, ctypes.cast(keys, c_char_p))
+        except Exception:
+            # If cast fails, try the safer create_string_buffer fallback
+            buf = create_string_buffer(32)
+            self.lib.XQueryKeymap(self.display, buf)
+            pressed = []
+            for name, code in self.keycodes.items():
+                byte_idx = code // 8
+                bit_idx = code % 8
+                if byte_idx < 32:
+                    if (buf[byte_idx] & (1 << bit_idx)) != 0:
+                        pressed.append(name)
+            return pressed
+
         pressed = []
         for name, code in self.keycodes.items():
             byte_idx = code // 8
             bit_idx = code % 8
-            if byte_idx < 32 and (keys[byte_idx][0] if isinstance(keys[byte_idx], bytes) else keys[byte_idx]) & (1 << bit_idx):
-                 pressed.append(name)
+            if byte_idx < 32:
+                if (keys[byte_idx] & (1 << bit_idx)) != 0:
+                    pressed.append(name)
         return pressed
 
 # --- INPUT ENGINE ---
 class InputEngine:
-    def __init__(self, honor_env=True, hold_timeout=0.14):
+    def __init__(self, honor_env=True, hold_timeout=0.6):
+        # keys: LIVE booleans, pressed: events (one-shot)
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
         self.pressed = set()
         self.ev_state = {k: False for k in self.keys}
@@ -201,8 +220,10 @@ class InputEngine:
         try:
             import evdev_input as evw
             self.wrapper = evw.EvdevInput()
-        except:
-            pass
+        except Exception:
+            self.wrapper = None
+        if self.wrapper:
+            print("InputEngine: using Wrapper/EvdevInput wrapper", file=sys.stderr)
 
         # Priority 2: Native Evdev (Linux /dev/input - requires root/permissions)
         self.native_fd_map = {}
@@ -222,8 +243,10 @@ class InputEngine:
                         ecodes.KEY_H: 'H', ecodes.KEY_ENTER: 'CONTINUE',
                         ecodes.KEY_M: 'M'
                     }
-            except:
-                pass
+            except Exception:
+                self.native_fd_map = {}
+        if self.native_fd_map:
+            print("InputEngine: using native evdev (/dev/input) devices", file=sys.stderr)
 
         # Priority 3: X11 Direct (Best for Chromebook/Desktop without root)
         self.x11 = None
@@ -231,8 +254,10 @@ class InputEngine:
         if not self.wrapper and not self.native_fd_map:
             try:
                 self.x11 = X11Input()
-            except:
-                pass
+            except Exception:
+                self.x11 = None
+        if self.x11:
+            print("InputEngine: using X11 direct polling (XQueryKeymap)", file=sys.stderr)
 
         # Priority 4: Termios (Fallback)
         self.term_mode = False
@@ -247,7 +272,9 @@ class InputEngine:
                 tty.setcbreak(self.stdin_fd)
                 self.term_mode = True
             except:
-                pass
+                self.term_mode = False
+        if self.term_mode:
+            print("InputEngine: using termios stdin fallback", file=sys.stderr)
 
         self.token_map = {
             'LEFT':'LEFT', 'RIGHT':'RIGHT', 'UP':'JUMP', 'DOWN':'DOWN',
@@ -263,7 +290,7 @@ class InputEngine:
             try:
                 evs = self.wrapper.poll(0.0)
             except:
-                pass
+                evs = []
             for t, v in evs:
                 mapped = self.token_map.get(t)
                 if mapped:
@@ -314,7 +341,10 @@ class InputEngine:
 
         # 4. Termios (Fallback)
         elif self.term_mode:
-            r, _, _ = select.select([self.stdin_fd], [], [], 0.0)
+            try:
+                r, _, _ = select.select([self.stdin_fd], [], [], 0.0)
+            except:
+                r = []
             if r:
                 try:
                     data = os.read(self.stdin_fd, 64).decode(errors='ignore')
@@ -925,7 +955,10 @@ def main(stdscr):
     locale.setlocale(locale.LC_ALL, '')
     curses.curs_set(0)
 
-    inp = InputEngine(honor_env=True)
+    # default hold timeout (seconds) to survive ChromeOS initial repeat delay
+    hold_timeout = 0.6
+
+    inp = None
     mode, path, tot_t, lvl = "CAMP", "", 0.0, 1
     resume_state = None
 
@@ -943,6 +976,12 @@ def main(stdscr):
         elif a == "--speedrun":
             SPEEDRUN_MODE = True
             i += 1
+        elif a == "--hold-timeout" and i + 1 < len(args):
+            try:
+                hold_timeout = float(args[i+1])
+            except:
+                hold_timeout = 0.6
+            i += 2
         else:
             mode, path = "SNGL", a
             i += 1
@@ -962,6 +1001,7 @@ def main(stdscr):
                     tot_t = float(resume_state["tot_time"])
 
     try:
+        inp = InputEngine(honor_env=True, hold_timeout=hold_timeout)
         while True:
             if mode == "CAMP":
                 if resume_state and "level_file" in resume_state:
@@ -1012,7 +1052,9 @@ def main(stdscr):
     except KeyboardInterrupt:
         pass
     finally:
-        inp.stop()
+        if inp:
+            inp.stop()
 
 if __name__ == "__main__":
     curses.wrapper(main)
+
