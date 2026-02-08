@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TerminalFormer2 - single-file input (evdev else pygame+XQueryKeymap) + game logic
 import curses, time, os, math, sys, json, glob, importlib.util, select
-import ctypes, locale, traceback
+import ctypes, locale
 from collections import deque
 from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
@@ -46,13 +46,14 @@ def save_score(cat, val, name="Player"):
     entries = data.get(cat, [])
     entries = [{"name":"UNK","time":x} if isinstance(x,(int,float)) else x for x in entries]
     entries.append({"name":name,"time":val}); entries.sort(key=lambda x:x["time"]); data[cat]=entries[:10]
-    try: open(DIRS['SCORES'],"w").write(json.dumps(data))
+    try:
+        with open(DIRS['SCORES'],"w") as f: json.dump(data, f)
     except: pass
 
 def save_game_state_to(path, state):
     try:
         tmp = path + ".tmp"
-        open(tmp, "w").write(json.dumps(state))
+        with open(tmp, "w") as f: json.dump(state, f)
         os.replace(tmp, path)
     except: pass
 
@@ -113,10 +114,8 @@ class EvdevBackend:
 # --- PYGAME+X11 BACKEND (works in Crostini even if curses is focused) ---
 class PygameBackend:
     """
-    Creates a tiny hidden pygame window (so SDL is happy) but polls X11's keyboard state
-    via XQueryKeymap to detect keys regardless of window focus. If X11 is unavailable,
-    it falls back to using pygame's event queue (requires focus).
-    force_focus() reasserts grab/pump/flip to coax SDL to accept keys again.
+    Hidden tiny pygame window + XQueryKeymap polling.
+    A robust refocus/recreate is available to recover SDL focus on Crostini.
     """
     def __init__(self):
         self.active = False
@@ -158,7 +157,6 @@ class PygameBackend:
                 if disp:
                     x11.XKeysymToKeycode.argtypes = [c_void_p, ctypes.c_ulong]; x11.XKeysymToKeycode.restype = ctypes.c_uint
                     x11.XQueryKeymap.argtypes = [c_void_p, c_char_p]
-                    x11.XQueryKeymap.restype = None
                     keycodes = {}
                     for name, sym in self._syms.items():
                         try:
@@ -167,6 +165,7 @@ class PygameBackend:
                             code = 0
                         if code:
                             keycodes[name] = int(code)
+                    # require at least arrows to consider X11 usable
                     if keycodes.get('LEFT') and keycodes.get('RIGHT'):
                         self._use_x11 = True
                         self._display = disp
@@ -175,16 +174,32 @@ class PygameBackend:
             except Exception:
                 self._use_x11 = False
 
-            # store a window id attempt (may vary by platform)
-            try:
-                info = pg.display.get_wm_info()
-                self._wm_window = info.get('window') or info.get('xwindow') or info.get('windowid') or None
-            except Exception:
-                self._wm_window = None
-
             self.active = True
         except Exception:
             self.active = False
+
+    def _recreate_display(self):
+        """Recreate the pygame display (useful when SDL/window lost focus on Crostini)."""
+        try:
+            pg = self.pg
+            try: pg.display.quit()
+            except: pass
+            try: pg.display.init()
+            except: pass
+            flags = pg.NOFRAME if hasattr(pg, 'NOFRAME') else 0
+            try:
+                self.screen = pg.display.set_mode((1,1), flags)
+            except:
+                self.screen = pg.display.set_mode((1,1))
+            try: pg.display.set_caption("tf-input")
+            except: pass
+            try: pg.event.set_grab(True)
+            except: pass
+            try: pg.mouse.set_visible(False)
+            except: pass
+            self._held.clear(); self._last.clear()
+        except Exception:
+            pass
 
     def poll(self, timeout=0.0):
         if not self.active:
@@ -213,6 +228,7 @@ class PygameBackend:
                 self._last = curr
                 self._held = set(curr)
             except Exception:
+                # if XQuery fails, fall back to events only
                 pass
 
         # always consume pygame events to keep SDL internal state sane
@@ -244,7 +260,20 @@ class PygameBackend:
             try: self.pg.event.pump()
             except: pass
 
-        # periodic reassert grab & flip
+        # if SDL window lost focus, try to re-create display and regrab
+        try:
+            focused = True
+            try:
+                focused = bool(self.pg.key.get_focused())
+            except Exception:
+                focused = True
+            if not focused:
+                # recreate display once to recover focus reliably on Crostini/Wayland combos
+                self._recreate_display()
+        except Exception:
+            pass
+
+        # periodic reassert grab/flip to keep SDL responsive
         now = time.time()
         if now - self._last_focus > self._focus_interval:
             self._last_focus = now
@@ -261,33 +290,27 @@ class PygameBackend:
         return set(self._held)
 
     def force_focus(self, timeout=0.2, step=0.01):
-        """Try hard to reassert focus/grab for `timeout` seconds (default 200ms)."""
+        """Try to reassert grab/flip and recreate display to coax SDL back."""
         if not getattr(self, "active", False): return
         pg = self.pg
         end = time.time() + timeout
         while time.time() < end:
-            try:
-                pg.event.pump()
-            except:
-                pass
-            try:
-                pg.event.set_grab(True)
-            except:
-                pass
-            try:
-                pg.display.flip()
-            except:
-                pass
-            # small sleep so we don't busy loop and so X/SDL can react
+            try: pg.event.pump()
+            except: pass
+            try: pg.event.set_grab(True)
+            except: pass
+            try: pg.display.flip()
+            except: pass
             time.sleep(step)
+        # one last recreate attempt
+        try: self._recreate_display()
+        except: pass
 
     def close(self):
         try:
             if getattr(self, "_use_x11", False) and getattr(self, "_x11", None) and getattr(self, "_display", None):
-                try:
-                    self._x11.XCloseDisplay.argtypes = [c_void_p]; self._x11.XCloseDisplay(self._display)
-                except:
-                    pass
+                try: self._x11.XCloseDisplay(self._display)
+                except: pass
                 self._display = None; self._x11 = None; self._use_x11 = False
         except:
             pass
