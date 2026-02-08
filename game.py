@@ -213,13 +213,133 @@ class X11Input:
                     pressed.add(name)
         return pressed
 
-# --- INPUT ENGINE (unified, evdev-like behavior) ---
+# --- PygameInput & updated InputEngine ---
+class PygameInput:
+    """Tiny hidden pygame window that captures KEYDOWN/KEYUP reliably.
+    Creates a 1x1 NOFRAME window, grabs keyboard, and re-grabs if focus is lost.
+    Produces raw tokens (strings) like 'LEFT','RIGHT','SPACE','W', etc.
+    """
+    def __init__(self):
+        self.active = False
+        self._last_focus_check = 0.0
+        self._focus_check_interval = 0.25
+        self._held = set()
+        try:
+            # Import locally so pygame becomes optional
+            import os as _os
+            _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "-100,-100")
+            import pygame as _pygame
+            self.pygame = _pygame
+            _pygame.init()
+            # Use NOFRAME so it's borderless; 1x1 so it's effectively invisible
+            flags = _pygame.NOFRAME
+            try:
+                # attempt to create the window
+                self.screen = _pygame.display.set_mode((1, 1), flags)
+            except Exception:
+                # fallback to normal tiny window if NOFRAME fails
+                self.screen = _pygame.display.set_mode((1, 1))
+            _pygame.display.set_caption("tf2-input-shim")
+            # grab the input so keyboard events are routed to us even if cursor leaves
+            try:
+                _pygame.event.set_grab(True)
+            except Exception:
+                pass
+            # hide mouse cursor so user doesn't see weirdness
+            try:
+                _pygame.mouse.set_visible(False)
+            except Exception:
+                pass
+
+            # map pygame key constants -> raw tokens we use in InputEngine
+            pg = _pygame
+            self.map = {
+                pg.K_LEFT: "LEFT", pg.K_RIGHT: "RIGHT", pg.K_UP: "UP", pg.K_DOWN: "DOWN",
+                pg.K_SPACE: "SPACE", pg.K_RETURN: "CONTINUE", pg.K_KP_ENTER: "CONTINUE",
+                pg.K_q: "Q", pg.K_r: "R", pg.K_m: "M",
+                pg.K_w: "W", pg.K_a: "A", pg.K_s: "S", pg.K_d: "D", pg.K_z: "Z",
+                pg.K_h: "H"
+            }
+            self.active = True
+        except Exception:
+            self.active = False
+
+    def close(self):
+        if not getattr(self, "active", False):
+            return
+        try:
+            self.pygame.event.set_grab(False)
+        except Exception:
+            pass
+        try:
+            self.pygame.quit()
+        except Exception:
+            pass
+        self.active = False
+
+    def poll(self, timeout=0.0):
+        """Return list of (raw_token, value) like evdev events. value:1=down,0=up"""
+        if not self.active:
+            return []
+        evs = []
+        pg = self.pygame
+
+        try:
+            for e in pg.event.get():
+                if e.type == pg.QUIT:
+                    continue
+                if e.type == pg.KEYDOWN:
+                    raw = self.map.get(e.key)
+                    if raw:
+                        if raw not in self._held:
+                            self._held.add(raw)
+                            evs.append((raw, 1))
+                elif e.type == pg.KEYUP:
+                    raw = self.map.get(e.key)
+                    if raw and raw in self._held:
+                        try:
+                            self._held.remove(raw)
+                        except Exception:
+                            pass
+                        evs.append((raw, 0))
+                elif e.type == pg.ACTIVEEVENT:
+                    pass
+        except Exception:
+            try:
+                pg.event.pump()
+            except Exception:
+                pass
+
+        now = time.time()
+        if now - self._last_focus_check > self._focus_check_interval:
+            self._last_focus_check = now
+            try:
+                focused = pg.key.get_focused()
+                if not focused:
+                    try:
+                        pg.event.set_grab(True)
+                    except Exception:
+                        pass
+                    try:
+                        pg.display.flip()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        return evs
+
+    def get_pressed_state(self):
+        """Return set of raw tokens currently held (similar to X11.get_pressed)"""
+        return set(self._held)
+
+
 class InputEngine:
     def __init__(self, honor_env=True, hold_timeout=0.6):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
-        self.pressed = set()                 # one-shot pressed tokens (consumed by clear())
-        self.ev_state = {k: False for k in self.keys}  # boolean current state per token
-        self._last_seen = {}                 # for termios: last time we observed token
+        self.pressed = set()
+        self.ev_state = {k: False for k in self.keys}
+        self._last_seen = {}
         self._hold_timeout = float(hold_timeout)
 
         # 1) wrapper (if provided)
@@ -229,10 +349,8 @@ class InputEngine:
             self.wrapper = evw.EvdevInput()
         except Exception:
             self.wrapper = None
-        if self.wrapper:
-            print("InputEngine: using Wrapper/EvdevInput wrapper", file=sys.stderr)
 
-        # 2) native evdev (/dev/input)
+        # 2) native evdev
         self.native_fd_map = {}
         self.native_map = {}
         if not self.wrapper:
@@ -252,25 +370,31 @@ class InputEngine:
                     }
             except Exception:
                 self.native_fd_map = {}
-        if self.native_fd_map:
-            print("InputEngine: using native evdev (/dev/input) devices", file=sys.stderr)
 
-        # 3) X11 polling
+        # 3) pygame shim (only if evdev not available)
+        self.pygame_input = None
+        if not self.wrapper and not self.native_fd_map:
+            try:
+                pgi = PygameInput()
+                if pgi.active:
+                    self.pygame_input = pgi
+            except Exception:
+                self.pygame_input = None
+
+        # 4) X11 polling
         self.x11 = None
         self.x11_prev = set()
-        if not self.wrapper and not self.native_fd_map:
+        if not self.wrapper and not self.native_fd_map and not self.pygame_input:
             try:
                 self.x11 = X11Input()
             except Exception:
                 self.x11 = None
-        if self.x11:
-            print("InputEngine: using X11 direct polling (XQueryKeymap)", file=sys.stderr)
 
-        # 4) termios fallback
+        # 5) termios fallback
         self.term_mode = False
         self.stdin_fd = None
         self._term_saved = None
-        if not self.wrapper and not self.native_fd_map and not self.x11:
+        if not self.wrapper and not self.native_fd_map and not self.pygame_input and not self.x11:
             try:
                 import tty, termios
                 self.stdin_fd = sys.stdin.fileno()
@@ -279,21 +403,33 @@ class InputEngine:
                 self.term_mode = True
             except Exception:
                 self.term_mode = False
-        if self.term_mode:
-            print("InputEngine: using termios stdin fallback", file=sys.stderr)
 
         # mapping raw tokens -> in-game tokens
         self.token_map = {
             'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
             'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
             'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
-            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT','W':'JUMP'
+            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
         }
 
+        # debug print which backend we are using
+        try:
+            if self.wrapper:
+                print("InputEngine: using wrapper/evdev_input", file=sys.stderr)
+            elif self.native_fd_map:
+                print("InputEngine: using native evdev (/dev/input)", file=sys.stderr)
+            elif self.pygame_input:
+                print("InputEngine: using pygame input shim", file=sys.stderr)
+            elif self.x11:
+                print("InputEngine: using X11 polling (XQueryKeymap)", file=sys.stderr)
+            elif self.term_mode:
+                print("InputEngine: using termios fallback", file=sys.stderr)
+            else:
+                print("InputEngine: no usable input backend found", file=sys.stderr)
+        except Exception:
+            pass
+
     def _apply_event(self, raw_token, value):
-        """Normalize raw token and update state.
-        value: 1=down, 0=up. Produces a one-shot pressed() on first-down only.
-        """
         mapped = self.token_map.get(raw_token)
         if not mapped:
             return
@@ -306,17 +442,17 @@ class InputEngine:
         else:
             self.ev_state[mapped] = False
             if mapped in self._last_seen:
-                del self._last_seen[mapped]
+                try: del self._last_seen[mapped]
+                except: pass
 
     def update(self, stdscr):
-        # Wrapper
+        # Wrapper (evdev_input)
         if self.wrapper:
             try:
                 evs = self.wrapper.poll(0.0)
             except Exception:
                 evs = []
             for t, v in evs:
-                # evdev: v==2 is repeat; treat as held
                 v2 = 1 if v == 1 else 0
                 self._apply_event(t, v2)
 
@@ -327,7 +463,7 @@ class InputEngine:
                 for fd in r:
                     dev = self.native_fd_map.get(fd)
                     for ev in dev.read():
-                        if ev.type == 1:  # EV_KEY
+                        if ev.type == 1:
                             raw = self.native_map.get(ev.code)
                             if raw:
                                 v2 = 1 if ev.value == 1 else 0
@@ -335,21 +471,37 @@ class InputEngine:
             except Exception:
                 pass
 
-        # X11 state-based polling
+        # Pygame shim
+        elif self.pygame_input:
+            try:
+                evs = self.pygame_input.poll(0.0)
+                for raw, v in evs:
+                    self._apply_event(raw, v)
+                # maintain current held state for continuous reads
+                curr = self.pygame_input.get_pressed_state()
+                for k in list(self.ev_state.keys()):
+                    self.ev_state[k] = False
+                for raw in curr:
+                    mapped = self.token_map.get(raw)
+                    if mapped:
+                        self.ev_state[mapped] = True
+                        self._last_seen[mapped] = time.time()
+            except Exception:
+                pass
+
+        # X11 polling
         elif self.x11:
             try:
                 curr = self.x11.get_pressed()
-                # generate down events for new keys
                 for raw in (curr - self.x11_prev):
                     self._apply_event(raw, 1)
-                # generate up events for released keys
                 for raw in (self.x11_prev - curr):
                     self._apply_event(raw, 0)
                 self.x11_prev = curr
             except Exception:
                 pass
 
-        # Termios fallback: parse raw bytes and simulate held-state
+        # Termios fallback
         elif self.term_mode:
             try:
                 r, _, _ = select.select([self.stdin_fd], [], [], 0.0)
@@ -361,28 +513,21 @@ class InputEngine:
                 except Exception:
                     data = ""
                 i = 0
-                # parse potential escape sequences for arrows
                 while i < len(data):
                     ch = data[i]
                     raw = None
                     if ch == '\x1b':
-                        # attempt to read up to 3 bytes for CSI sequences
                         seq = data[i:i+3]
                         if seq.startswith("\x1b[A"):
-                            raw = "UP"
-                            i += 3
+                            raw = "UP"; i += 3
                         elif seq.startswith("\x1b[B"):
-                            raw = "DOWN"
-                            i += 3
+                            raw = "DOWN"; i += 3
                         elif seq.startswith("\x1b[C"):
-                            raw = "RIGHT"
-                            i += 3
+                            raw = "RIGHT"; i += 3
                         elif seq.startswith("\x1b[D"):
-                            raw = "LEFT"
-                            i += 3
+                            raw = "LEFT"; i += 3
                         else:
-                            i += 1
-                            continue
+                            i += 1; continue
                     else:
                         if ch == ' ':
                             raw = 'SPACE'
@@ -395,21 +540,17 @@ class InputEngine:
                         i += 1
                     if raw:
                         self._apply_event(raw, 1)
-
-            # release keys not seen recently
             now = time.time()
             to_release = [k for k, ts in self._last_seen.items() if now - ts > self._hold_timeout]
             for k in to_release:
-                # find a raw token mapping to k and emit up
                 raw_equiv = None
                 for raw, mapped in self.token_map.items():
                     if mapped == k:
-                        raw_equiv = raw
-                        break
+                        raw_equiv = raw; break
                 if raw_equiv:
                     self._apply_event(raw_equiv, 0)
 
-        # curses nav fallback (immediate)
+        # curses nav fallback
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
@@ -432,7 +573,7 @@ class InputEngine:
         for k in self.keys:
             self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
-    # API expected by the rest of your code
+    # API
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
@@ -445,6 +586,13 @@ class InputEngine:
         self.x11_prev.clear()
 
     def stop(self):
+        # cleanup backends
+        if hasattr(self, "wrapper") and self.wrapper:
+            try: self.wrapper.close()
+            except: pass
+        if getattr(self, "pygame_input", None):
+            try: self.pygame_input.close()
+            except: pass
         if self.x11:
             try: self.x11.close()
             except: pass
