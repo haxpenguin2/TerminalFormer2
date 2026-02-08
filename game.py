@@ -33,7 +33,6 @@ def load_plugins():
         except Exception:
             pass
 load_plugins()
-def get_plugin(ch): return REGISTRY.get(ch)
 
 # --- scores / save helpers ---
 SAVE_SLOT_PATH = None; RESUME_FLAG = False; SPEEDRUN_MODE = False
@@ -115,7 +114,7 @@ class EvdevBackend:
 class PygameBackend:
     """
     Hidden tiny pygame window + XQueryKeymap polling.
-    A robust refocus/recreate is available to recover SDL focus on Crostini.
+    Recreates display when focus looks lost to avoid clicking requirement.
     """
     def __init__(self):
         self.active = False
@@ -165,7 +164,6 @@ class PygameBackend:
                             code = 0
                         if code:
                             keycodes[name] = int(code)
-                    # require at least arrows to consider X11 usable
                     if keycodes.get('LEFT') and keycodes.get('RIGHT'):
                         self._use_x11 = True
                         self._display = disp
@@ -228,7 +226,6 @@ class PygameBackend:
                 self._last = curr
                 self._held = set(curr)
             except Exception:
-                # if XQuery fails, fall back to events only
                 pass
 
         # always consume pygame events to keep SDL internal state sane
@@ -302,7 +299,6 @@ class PygameBackend:
             try: pg.display.flip()
             except: pass
             time.sleep(step)
-        # one last recreate attempt
         try: self._recreate_display()
         except: pass
 
@@ -331,6 +327,7 @@ class InputEngine:
         self._hold_timeout = float(hold_timeout)
         self.backend = None
         self.backend_type = None
+        self._raw_evs = []   # store last raw backend events for menus
 
         # try evdev if event devices exist and import works
         try:
@@ -387,6 +384,9 @@ class InputEngine:
                 evs = self.backend.poll(0.0)
         except Exception:
             evs = []
+        # expose raw events for menu usage
+        self._raw_evs = list(evs)
+
         for raw, v in evs:
             self._apply_event(raw, v)
 
@@ -414,7 +414,7 @@ class InputEngine:
             if raw_equiv:
                 self._apply_event(raw_equiv, 0)
 
-        # curses fallback for menu input
+        # curses fallback for menu input (still check it so terminals without X still work)
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
@@ -424,7 +424,8 @@ class InputEngine:
                     curses.KEY_LEFT: 'LEFT', curses.KEY_RIGHT: 'RIGHT',
                     ord(' '): 'JUMP', ord('r'): 'RESET', ord('R'): 'RESET',
                     ord('q'): 'QUIT', ord('Q'): 'QUIT', ord('m'): 'MENU',
-                    ord('M'): 'MENU', 10: 'CONTINUE', 13: 'CONTINUE'
+                    ord('M'): 'MENU', 10: 'CONTINUE', 13: 'CONTINUE',
+                    curses.KEY_UP: 'UP', curses.KEY_DOWN: 'DOWN'
                 }.get(k)
                 if n:
                     curses_keys[n] = True
@@ -434,6 +435,10 @@ class InputEngine:
 
         for k in self.keys:
             self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
+
+    # helper for menu: read raw backend events (useful when curses isn't focused)
+    def raw_events(self):
+        return list(self._raw_evs)
 
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
@@ -449,7 +454,7 @@ class InputEngine:
                 except: pass
         except: pass
 
-# --- game objects & helpers (condensed, unchanged logic) ---
+# --- game objects & helpers (condensed) ---
 class Platform:
     def __init__(self, d, start_t=0.0):
         self.ox, self.oy, self.w = d['x'], d['y'], d['w']
@@ -565,25 +570,71 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-def show_in_game_menu(stdscr, allow_save=True):
+# ---- MENU: now accepts `inp` and uses raw backend events so clicking is NOT required ----
+def show_in_game_menu(stdscr, inp, allow_save=True):
     opts=["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu","Save Position (Slot)","Clear Slot Data"])
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"; opts.extend([quit_txt,"Cancel"])
     idx=0; stdscr.nodelay(False)
-    while True:
-        draw_centered_menu(stdscr,"PAUSE MENU",opts,idx); k=stdscr.getch()
-        if k==curses.KEY_UP: idx=(idx-1)%len(opts)
-        elif k==curses.KEY_DOWN: idx=(idx+1)%len(opts)
-        elif k in (10,13):
-            sel=opts[idx]; stdscr.nodelay(True)
-            if sel=="Resume": return "RESUME"
-            if sel=="Save & Quit to Menu": return "SAVE_QUIT"
-            if sel==quit_txt: return "QUIT_NO_SAVE"
-            if sel=="Save Position (Slot)": return "SAVE_ONLY"
-            if sel=="Clear Slot Data": return "CLEAR_SLOT"
-            return "CANCEL"
-        elif k in (ord('m'),ord('M'),ord('q'),ord('Q')): stdscr.nodelay(True); return "RESUME"
+    # ensure backend focus for duration of menu
+    try:
+        if hasattr(inp, "force_focus"): inp.force_focus()
+    except: pass
 
+    last_nav_time = 0
+    nav_delay = 0.12  # debounce
+    while True:
+        # keep backend updated so raw events arrive even if curses isn't focused
+        inp.update(stdscr)
+        # reassert focus regularly to avoid SDL losing grab while menu displayed
+        try:
+            if hasattr(inp, "force_focus"): inp.force_focus()
+        except: pass
+
+        # draw menu frame
+        draw_centered_menu(stdscr,"PAUSE MENU",opts,idx)
+
+        # 1) read raw backend presses first (works when terminal isn't focused)
+        raw = inp.raw_events()
+        handled = False
+        now = time.time()
+        if raw:
+            for r,v in raw:
+                if v != 1: continue
+                # navigation keys: UP / DOWN / W / S / LEFT / RIGHT
+                if r in ('UP','W'):
+                    if now - last_nav_time > nav_delay:
+                        idx = (idx - 1) % len(opts); last_nav_time = now; handled = True
+                elif r in ('DOWN','S'):
+                    if now - last_nav_time > nav_delay:
+                        idx = (idx + 1) % len(opts); last_nav_time = now; handled = True
+                elif r in ('LEFT',):
+                    if now - last_nav_time > nav_delay:
+                        idx = (idx - 1) % len(opts); last_nav_time = now; handled = True
+                elif r in ('RIGHT',):
+                    if now - last_nav_time > nav_delay:
+                        idx = (idx + 1) % len(opts); last_nav_time = now; handled = True
+                elif r in ('CONTINUE','ENTER','SPACE','Q'):  # accept/enter or Q as quick select
+                    sel = opts[idx]
+                    stdscr.nodelay(True)
+                    inp.clear()
+                    return sel if sel != "Resume" else "RESUME"
+        # 2) fallback to curses.getch if backend didn't handle input (keeps arrow keys working in normal terminals)
+        try:
+            k = stdscr.getch()
+            if k != -1:
+                if k == curses.KEY_UP:
+                    idx = (idx - 1) % len(opts)
+                elif k == curses.KEY_DOWN:
+                    idx = (idx + 1) % len(opts)
+                elif k in (10,13):
+                    sel = opts[idx]; stdscr.nodelay(True); return sel if sel != "Resume" else "RESUME"
+                elif k in (ord('m'), ord('M'), ord('q'), ord('Q')):
+                    stdscr.nodelay(True); return "RESUME"
+        except Exception:
+            pass
+
+# (arcade_name_entry and remaining game code unchanged)
 def arcade_name_entry(stdscr,total_time):
     stdscr.nodelay(False); name=""
     while True:
@@ -598,7 +649,7 @@ def arcade_name_entry(stdscr,total_time):
         if k in (curses.KEY_BACKSPACE,127,8): name=name[:-1]
         elif 32<=k<=126 and len(name)<10: name += chr(k).upper()
 
-# --- main play loop (same behavior) ---
+# --- main play loop (same as before, but calls show_in_game_menu(stdscr, inp, ...) ) ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
     p_timers=[]; plugin_data={}
@@ -633,11 +684,10 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         inp.update(stdscr)
         if inp.was('MENU') or inp.was('QUIT'):
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset+cur_t, level_num, title)
-            choice = show_in_game_menu(stdscr, allow_save=allow_save)
+            choice = show_in_game_menu(stdscr, inp, allow_save=allow_save)
 
             if choice in ("RESUME","CANCEL"):
                 inp.clear(); last=time.time()
-                # reassert focus right after leaving menu
                 try:
                     if hasattr(inp, "force_focus"): inp.force_focus()
                 except: pass
