@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # TerminalFormer2 - single-file input (evdev else pygame+XQueryKeymap) + game logic
 import curses, time, os, math, sys, json, glob, importlib.util, select
-import ctypes, locale
+import ctypes, locale, traceback
 from collections import deque
 from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
@@ -414,9 +414,19 @@ class InputEngine:
             if raw_equiv:
                 self._apply_event(raw_equiv, 0)
 
-        # curses fallback for menu input (still check it so terminals without X still work)
+        # curses fallback for menu input (non-blocking)
         curses_keys = {k: False for k in self.keys}
         try:
+            # ensure non-blocking read so update never stalls
+            prev_nodelay = None
+            try:
+                prev_nodelay = stdscr.nodelay(False)  # attempt to read current state; curses API inconsistent across pythons
+            except:
+                prev_nodelay = None
+            try:
+                stdscr.nodelay(True)
+            except:
+                pass
             while True:
                 k = stdscr.getch()
                 if k == -1: break
@@ -432,6 +442,10 @@ class InputEngine:
                     self._apply_event(n, 1)
         except Exception:
             pass
+        finally:
+            # best-effort restore: leave nodelay True for menus; not forcing curses state here
+            try: stdscr.nodelay(True)
+            except: pass
 
         for k in self.keys:
             self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
@@ -570,12 +584,14 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-# ---- MENU: now accepts `inp` and uses raw backend events so clicking is NOT required ----
+# ---- MENU: non-blocking and uses backend raw events so clicking is NOT required ----
 def show_in_game_menu(stdscr, inp, allow_save=True):
     opts=["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu","Save Position (Slot)","Clear Slot Data"])
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"; opts.extend([quit_txt,"Cancel"])
-    idx=0; stdscr.nodelay(False)
+    idx=0
+    # use non-blocking mode so InputEngine.update never blocks
+    stdscr.nodelay(True)
     # ensure backend focus for duration of menu
     try:
         if hasattr(inp, "force_focus"): inp.force_focus()
@@ -583,43 +599,43 @@ def show_in_game_menu(stdscr, inp, allow_save=True):
 
     last_nav_time = 0
     nav_delay = 0.12  # debounce
+    loop_sleep = 0.01
     while True:
-        # keep backend updated so raw events arrive even if curses isn't focused
+        # poll backend and curses each frame
         inp.update(stdscr)
-        # reassert focus regularly to avoid SDL losing grab while menu displayed
+
+        # reassert focus occasionally
         try:
             if hasattr(inp, "force_focus"): inp.force_focus()
         except: pass
 
-        # draw menu frame
         draw_centered_menu(stdscr,"PAUSE MENU",opts,idx)
 
         # 1) read raw backend presses first (works when terminal isn't focused)
         raw = inp.raw_events()
-        handled = False
         now = time.time()
         if raw:
             for r,v in raw:
                 if v != 1: continue
-                # navigation keys: UP / DOWN / W / S / LEFT / RIGHT
                 if r in ('UP','W'):
                     if now - last_nav_time > nav_delay:
-                        idx = (idx - 1) % len(opts); last_nav_time = now; handled = True
+                        idx = (idx - 1) % len(opts); last_nav_time = now
                 elif r in ('DOWN','S'):
                     if now - last_nav_time > nav_delay:
-                        idx = (idx + 1) % len(opts); last_nav_time = now; handled = True
+                        idx = (idx + 1) % len(opts); last_nav_time = now
                 elif r in ('LEFT',):
                     if now - last_nav_time > nav_delay:
-                        idx = (idx - 1) % len(opts); last_nav_time = now; handled = True
+                        idx = (idx - 1) % len(opts); last_nav_time = now
                 elif r in ('RIGHT',):
                     if now - last_nav_time > nav_delay:
-                        idx = (idx + 1) % len(opts); last_nav_time = now; handled = True
-                elif r in ('CONTINUE','ENTER','SPACE','Q'):  # accept/enter or Q as quick select
+                        idx = (idx + 1) % len(opts); last_nav_time = now
+                elif r in ('CONTINUE','ENTER','SPACE','Q'):
                     sel = opts[idx]
-                    stdscr.nodelay(True)
                     inp.clear()
+                    stdscr.nodelay(True)
                     return sel if sel != "Resume" else "RESUME"
-        # 2) fallback to curses.getch if backend didn't handle input (keeps arrow keys working in normal terminals)
+
+        # 2) fallback to non-blocking curses.getch
         try:
             k = stdscr.getch()
             if k != -1:
@@ -628,13 +644,15 @@ def show_in_game_menu(stdscr, inp, allow_save=True):
                 elif k == curses.KEY_DOWN:
                     idx = (idx + 1) % len(opts)
                 elif k in (10,13):
-                    sel = opts[idx]; stdscr.nodelay(True); return sel if sel != "Resume" else "RESUME"
+                    sel = opts[idx]; inp.clear(); stdscr.nodelay(True); return sel if sel != "Resume" else "RESUME"
                 elif k in (ord('m'), ord('M'), ord('q'), ord('Q')):
-                    stdscr.nodelay(True); return "RESUME"
+                    inp.clear(); stdscr.nodelay(True); return "RESUME"
         except Exception:
             pass
 
-# (arcade_name_entry and remaining game code unchanged)
+        time.sleep(loop_sleep)
+
+# (arcade_name_entry and rest of game code unchanged)
 def arcade_name_entry(stdscr,total_time):
     stdscr.nodelay(False); name=""
     while True:
@@ -649,7 +667,7 @@ def arcade_name_entry(stdscr,total_time):
         if k in (curses.KEY_BACKSPACE,127,8): name=name[:-1]
         elif 32<=k<=126 and len(name)<10: name += chr(k).upper()
 
-# --- main play loop (same as before, but calls show_in_game_menu(stdscr, inp, ...) ) ---
+# --- main play loop (unchanged except menu call signature) ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
     p_timers=[]; plugin_data={}
