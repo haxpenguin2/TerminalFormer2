@@ -107,7 +107,7 @@ class EvdevBackend:
         return evs
 
     def set_grab(self, state):
-        pass
+        pass # Not needed for evdev usually
 
     def close(self):
         for d in getattr(self,"devices",[]):
@@ -188,7 +188,6 @@ class PygameBackend:
         if not self.active: return
         try:
             self.pg.event.set_grab(state)
-            if not state: self.pg.event.set_grab(False)
         except: pass
 
     def poll(self, timeout=0.0):
@@ -309,54 +308,81 @@ class InputEngine:
                 else: self.backend = None
         except Exception: self.backend = None
         self.token_map = {
-            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
-            'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
-            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
-            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
+            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN','SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
         }
 
     def set_menu_mode(self, active):
+        """When entering menu: release any pygame grab and clear held keys.
+           When returning to game: reassert grab and force focus, and clear previous presses."""
         self._menu_mode = active
         if self.backend and hasattr(self.backend, 'set_grab'):
             try:
-                # when in menu, release grab so curses can accept mouse/keyboard if needed;
-                # when returning to game, regrab and force focus.
+                # release grab while in menu so curses is the only input source
                 self.backend.set_grab(not active)
-                if not active and hasattr(self.backend, 'force_focus'):
-                    # reassert quickly when returning to game
+            except: pass
+            # clear any held states to avoid leaks
+            try:
+                if hasattr(self.backend, '_held'):
+                    self.backend._held.clear()
+                if hasattr(self.backend, '_last'):
+                    self.backend._last.clear()
+            except: pass
+        if not active:
+            # returning to game: ensure SDL focus/grab and clear engine pressed states
+            try:
+                if self.backend and hasattr(self.backend, 'force_focus'):
                     self.backend.force_focus()
             except: pass
+            self.clear()
 
     def update(self, stdscr):
-        # always poll backend to keep SDL/evdev pumped, even when in menu (we won't map menu events to game)
+        """
+        Always poll backend to keep SDL/X pumped (prevents needing a click).
+        Only *apply* backend events to game state when not in menu mode.
+        Curses input is always read (so menus work via curses).
+        """
         evs = []
         try:
-            if self.backend: evs = self.backend.poll(0.0)
-        except Exception: evs = []
-        for raw, v in evs:
-            self._apply_event(raw, v)
+            if self.backend:
+                evs = self.backend.poll(0.0)
+        except Exception:
+            evs = []
 
-        if self.backend and self.backend_type and self.backend_type.startswith("pygame"):
+        # Apply events only when not in menu mode (user requested pygame input to do nothing in menus)
+        if not self._menu_mode:
+            for raw, v in evs: self._apply_event(raw, v)
+        else:
+            # discard backend events but keep internal held state cleared (already cleared in set_menu_mode)
+            pass
+
+        # For pygame path, sync held-set -> ev_state to allow continuous down()
+        if self.backend_type and self.backend_type.startswith("pygame") and not self._menu_mode:
             try:
                 held = self.backend.get_pressed_state()
                 for k in list(self.ev_state.keys()): self.ev_state[k] = False
                 for raw in held:
                     m = self.token_map.get(raw)
-                    if m: self.ev_state[m] = True; self._last_seen[m] = time.time()
+                    if m:
+                        self.ev_state[m] = True
+                        self._last_seen[m] = time.time()
             except Exception: pass
 
+        # release by timeout
         now = time.time()
         to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
         for k in to_rel:
             raw_equiv = None
             for raw, mapped in self.token_map.items():
-                if mapped == k: raw_equiv = raw; break
-            if raw_equiv: self._apply_event(raw_equiv, 0)
+                if mapped == k:
+                    raw_equiv = raw; break
+            if raw_equiv:
+                self._apply_event(raw_equiv, 0)
 
-        # curses fallback for menu input (non-blocking read)
+        # curses fallback (always check, so menus always responsive)
         curses_keys = {k: False for k in self.keys}
         try:
-            # don't block here; menu uses timeout so update is called periodically
+            # non-blocking loop: read what's already available
             while True:
                 k = stdscr.getch()
                 if k == -1: break
@@ -364,7 +390,9 @@ class InputEngine:
                     ord('q'):'QUIT', ord('Q'):'QUIT', ord('m'):'MENU', ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
                 if n: curses_keys[n] = True; self._apply_event(n, 1)
         except Exception: pass
-        for k in self.keys: self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
+
+        for k in self.keys:
+            self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
     def _apply_event(self, raw, value):
         mapped = self.token_map.get(raw)
@@ -503,19 +531,19 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-# ---- MENU: use curses navigation but keep polling backend so SDL/evdev aren't starved ----
 def show_in_game_menu(stdscr, inp, allow_save=True):
+    # Enter menu: release grab and run a timeout loop so we can pump backend
     inp.set_menu_mode(True)
-    # use timeout instead of blocking getch so we can poll backend regularly
-    stdscr.timeout(100)  # 100 ms
+    stdscr.timeout(100)  # 100 ms to allow periodic backend polling while still using standard curses input
+
     opts=["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu","Save Position (Slot)","Clear Slot Data"])
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"; opts.extend([quit_txt,"Cancel"])
-    idx=0; ret_val="RESUME"
+    idx=0; ret_val = "RESUME"
     last_focus = 0
 
     while True:
-        # pump backend so SDL remains responsive (esp. in Crostini)
+        # pump backend each iteration so SDL/pygame doesn't stall (but don't apply its keys to game)
         try:
             if getattr(inp, "backend", None):
                 try: inp.backend.poll(0.0)
@@ -527,7 +555,6 @@ def show_in_game_menu(stdscr, inp, allow_save=True):
             k = stdscr.getch()
         except: k = -1
 
-        # handle curses navigation
         if k == curses.KEY_UP: idx=(idx-1)%len(opts)
         elif k == curses.KEY_DOWN: idx=(idx+1)%len(opts)
         elif k in (10,13):
@@ -541,7 +568,7 @@ def show_in_game_menu(stdscr, inp, allow_save=True):
         elif k in (ord('m'),ord('M'),ord('q'),ord('Q')):
             ret_val="RESUME"; break
 
-        # periodically reassert focus so SDL doesn't demand a click later
+        # occasionally reassert focus so SDL doesn't demand click after returning
         now = time.time()
         if now - last_focus > 0.5:
             last_focus = now
@@ -551,10 +578,10 @@ def show_in_game_menu(stdscr, inp, allow_save=True):
                     except: pass
             except: pass
 
-    # restore fast non-blocking game state
     stdscr.timeout(-1)
     inp.set_menu_mode(False)
-    # reassert focus on return
+    # clear lingering presses
+    inp.clear()
     try:
         if hasattr(inp, "backend") and getattr(inp, "backend", None) and hasattr(inp.backend, "force_focus"):
             try: inp.backend.force_focus()
@@ -568,7 +595,7 @@ def arcade_name_entry(stdscr, inp, total_time):
     name=""
     last_focus = 0
     while True:
-        # pump backend
+        # pump backend so SDL is happy while blocking on curses input
         try:
             if getattr(inp, "backend", None):
                 try: inp.backend.poll(0.0)
@@ -601,6 +628,7 @@ def arcade_name_entry(stdscr, inp, total_time):
 
     stdscr.timeout(-1)
     inp.set_menu_mode(False)
+    inp.clear()
     try:
         if hasattr(inp, "backend") and getattr(inp, "backend", None) and hasattr(inp.backend, "force_focus"):
             try: inp.backend.force_focus()
@@ -633,7 +661,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
     cx,cy=0,0; fps_h=deque(maxlen=30); start=time.time(); last=time.time(); cur_t=0.0; msg=None; mend=0
     ap=None; ap_off=0.0; stdscr.nodelay(True)
 
-    # ensure focus at start
+    # ensure game-mode (grab) on start
     if hasattr(inp, 'set_menu_mode'): inp.set_menu_mode(False)
 
     def make_game_state(): return {"grid":grid,"platforms":plats,"level":title,"meta":meta}
@@ -641,7 +669,6 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         inp.update(stdscr)
         if inp.was('MENU') or inp.was('QUIT'):
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset+cur_t, level_num, title)
-            # Pass inp so menu can release focus
             choice = show_in_game_menu(stdscr, inp, allow_save=allow_save)
 
             if choice in ("RESUME","CANCEL"):
@@ -844,3 +871,4 @@ def main(stdscr):
 
 if __name__ == "__main__":
     curses.wrapper(main)
+
