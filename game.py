@@ -106,17 +106,16 @@ class EvdevBackend:
             pass
         return evs
 
+    def set_grab(self, state):
+        pass # Not needed for evdev usually, or complicates things
+
     def close(self):
         for d in getattr(self,"devices",[]):
             try: d.close()
             except: pass
 
-# --- PYGAME+X11 BACKEND (works in Crostini even if curses is focused) ---
+# --- PYGAME+X11 BACKEND ---
 class PygameBackend:
-    """
-    Hidden tiny pygame window + XQueryKeymap polling.
-    A robust refocus/recreate is available to recover SDL focus on Crostini.
-    """
     def __init__(self):
         self.active = False
         self._held = set()
@@ -139,17 +138,14 @@ class PygameBackend:
             self.pg = pg
             pg.init()
             flags = pg.NOFRAME if hasattr(pg, 'NOFRAME') else 0
-            try:
-                self.screen = pg.display.set_mode((1,1), flags)
-            except:
-                self.screen = pg.display.set_mode((1,1))
+            try: self.screen = pg.display.set_mode((1,1), flags)
+            except: self.screen = pg.display.set_mode((1,1))
             pg.display.set_caption("tf-input")
             try: pg.event.set_grab(True)
             except: pass
             try: pg.mouse.set_visible(False)
             except: pass
 
-            # try X11 for keymap polling
             try:
                 x11 = ctypes.CDLL("libX11.so.6")
                 x11.XOpenDisplay.argtypes = [c_char_p]; x11.XOpenDisplay.restype = c_void_p
@@ -161,25 +157,15 @@ class PygameBackend:
                     for name, sym in self._syms.items():
                         try:
                             code = x11.XKeysymToKeycode(disp, sym)
-                        except Exception:
-                            code = 0
-                        if code:
-                            keycodes[name] = int(code)
-                    # require at least arrows to consider X11 usable
+                        except Exception: code = 0
+                        if code: keycodes[name] = int(code)
                     if keycodes.get('LEFT') and keycodes.get('RIGHT'):
-                        self._use_x11 = True
-                        self._display = disp
-                        self._x11 = x11
-                        self._keycodes = keycodes
-            except Exception:
-                self._use_x11 = False
-
+                        self._use_x11 = True; self._display = disp; self._x11 = x11; self._keycodes = keycodes
+            except Exception: self._use_x11 = False
             self.active = True
-        except Exception:
-            self.active = False
+        except Exception: self.active = False
 
     def _recreate_display(self):
-        """Recreate the pygame display (useful when SDL/window lost focus on Crostini)."""
         try:
             pg = self.pg
             try: pg.display.quit()
@@ -187,10 +173,8 @@ class PygameBackend:
             try: pg.display.init()
             except: pass
             flags = pg.NOFRAME if hasattr(pg, 'NOFRAME') else 0
-            try:
-                self.screen = pg.display.set_mode((1,1), flags)
-            except:
-                self.screen = pg.display.set_mode((1,1))
+            try: self.screen = pg.display.set_mode((1,1), flags)
+            except: self.screen = pg.display.set_mode((1,1))
             try: pg.display.set_caption("tf-input")
             except: pass
             try: pg.event.set_grab(True)
@@ -198,14 +182,18 @@ class PygameBackend:
             try: pg.mouse.set_visible(False)
             except: pass
             self._held.clear(); self._last.clear()
-        except Exception:
-            pass
+        except Exception: pass
+
+    def set_grab(self, state):
+        if not self.active: return
+        try:
+            self.pg.event.set_grab(state)
+            if not state: self.pg.event.set_grab(False)
+        except: pass
 
     def poll(self, timeout=0.0):
-        if not self.active:
-            return []
+        if not self.active: return []
         evs = []
-        # XQueryKeymap path (state-based, focus-agnostic)
         if self._use_x11 and self._display and self._x11:
             try:
                 KeysArray = c_ubyte * 32
@@ -213,25 +201,16 @@ class PygameBackend:
                 self._x11.XQueryKeymap(self._display, ctypes.cast(keys, c_char_p))
                 curr = set()
                 for name, code in self._keycodes.items():
-                    byte_idx = code // 8
-                    bit_idx = code % 8
+                    byte_idx = code // 8; bit_idx = code % 8
                     if byte_idx < 32:
                         try:
-                            if (keys[byte_idx] & (1 << bit_idx)) != 0:
-                                curr.add(name)
-                        except Exception:
-                            pass
-                for down in (curr - self._last):
-                    evs.append((down, 1))
-                for up in (self._last - curr):
-                    evs.append((up, 0))
-                self._last = curr
-                self._held = set(curr)
-            except Exception:
-                # if XQuery fails, fall back to events only
-                pass
+                            if (keys[byte_idx] & (1 << bit_idx)) != 0: curr.add(name)
+                        except Exception: pass
+                for down in (curr - self._last): evs.append((down, 1))
+                for up in (self._last - curr): evs.append((up, 0))
+                self._last = curr; self._held = set(curr)
+            except Exception: pass
 
-        # always consume pygame events to keep SDL internal state sane
         try:
             for e in self.pg.event.get():
                 if e.type == self.pg.KEYDOWN:
@@ -242,8 +221,7 @@ class PygameBackend:
                         self.pg.K_w:"W", self.pg.K_a:"A", self.pg.K_s:"S", self.pg.K_d:"D", self.pg.K_z:"Z",
                         self.pg.K_h:"H"
                     }.get(e.key)
-                    if mapped and mapped not in self._held:
-                        self._held.add(mapped); evs.append((mapped, 1))
+                    if mapped and mapped not in self._held: self._held.add(mapped); evs.append((mapped, 1))
                 elif e.type == self.pg.KEYUP:
                     mapped = {
                         self.pg.K_LEFT:"LEFT", self.pg.K_RIGHT:"RIGHT", self.pg.K_UP:"UP", self.pg.K_DOWN:"DOWN",
@@ -260,20 +238,13 @@ class PygameBackend:
             try: self.pg.event.pump()
             except: pass
 
-        # if SDL window lost focus, try to re-create display and regrab
         try:
             focused = True
-            try:
-                focused = bool(self.pg.key.get_focused())
-            except Exception:
-                focused = True
-            if not focused:
-                # recreate display once to recover focus reliably on Crostini/Wayland combos
-                self._recreate_display()
-        except Exception:
-            pass
+            try: focused = bool(self.pg.key.get_focused())
+            except Exception: focused = True
+            if not focused: self._recreate_display()
+        except Exception: pass
 
-        # periodic reassert grab/flip to keep SDL responsive
         now = time.time()
         if now - self._last_focus > self._focus_interval:
             self._last_focus = now
@@ -283,17 +254,13 @@ class PygameBackend:
                 try: self.pg.display.flip()
                 except: pass
             except: pass
-
         return evs
 
-    def get_pressed_state(self):
-        return set(self._held)
+    def get_pressed_state(self): return set(self._held)
 
     def force_focus(self, timeout=0.2, step=0.01):
-        """Try to reassert grab/flip and recreate display to coax SDL back."""
         if not getattr(self, "active", False): return
-        pg = self.pg
-        end = time.time() + timeout
+        pg = self.pg; end = time.time() + timeout
         while time.time() < end:
             try: pg.event.pump()
             except: pass
@@ -302,7 +269,6 @@ class PygameBackend:
             try: pg.display.flip()
             except: pass
             time.sleep(step)
-        # one last recreate attempt
         try: self._recreate_display()
         except: pass
 
@@ -312,8 +278,7 @@ class PygameBackend:
                 try: self._x11.XCloseDisplay(self._display)
                 except: pass
                 self._display = None; self._x11 = None; self._use_x11 = False
-        except:
-            pass
+        except: pass
         if not getattr(self, "active", False): return
         try: self.pg.event.set_grab(False)
         except: pass
@@ -321,52 +286,76 @@ class PygameBackend:
         except: pass
         self.active = False
 
-# --- INPUT ENGINE (only evdev or pygame-backed XQueryKeymap) ---
+# --- INPUT ENGINE ---
 class InputEngine:
     def __init__(self, hold_timeout=0.6):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
-        self.pressed = set()
-        self.ev_state = {k: False for k in self.keys}
-        self._last_seen = {}
-        self._hold_timeout = float(hold_timeout)
-        self.backend = None
-        self.backend_type = None
+        self.pressed = set(); self.ev_state = {k: False for k in self.keys}
+        self._last_seen = {}; self._hold_timeout = float(hold_timeout)
+        self.backend = None; self.backend_type = None
+        self._menu_mode = False
 
-        # try evdev if event devices exist and import works
         try:
             has_events = False
             if os.path.isdir("/dev/input"):
                 for fn in os.listdir("/dev/input"):
                     if fn.startswith("event"): has_events = True; break
             if has_events:
-                try:
-                    self.backend = EvdevBackend(); self.backend_type = "evdev"
-                except Exception:
-                    self.backend = None
+                try: self.backend = EvdevBackend(); self.backend_type = "evdev"
+                except Exception: self.backend = None
             if not self.backend:
                 p = PygameBackend()
-                if p.active:
-                    self.backend = p; self.backend_type = "pygame-x11" if getattr(p, "_use_x11", False) else "pygame"
-                else:
-                    self.backend = None
-        except Exception:
-            self.backend = None
-
+                if p.active: self.backend = p; self.backend_type = "pygame-x11" if getattr(p, "_use_x11", False) else "pygame"
+                else: self.backend = None
+        except Exception: self.backend = None
         self.token_map = {
-            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
-            'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
-            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
-            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
+            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN','SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT','W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
         }
-        try: print(f"InputEngine: backend={self.backend_type}", file=sys.stderr)
-        except: pass
 
-    def force_focus(self):
+    def set_menu_mode(self, active):
+        self._menu_mode = active
+        if self.backend and hasattr(self.backend, 'set_grab'):
+            if active: self.backend.set_grab(False)
+            else:
+                self.backend.set_grab(True)
+                if hasattr(self.backend, 'force_focus'): self.backend.force_focus()
+
+    def update(self, stdscr):
+        if self._menu_mode: return # Do not process game inputs in menu mode
+        evs = []
         try:
-            if getattr(self, "backend", None) and hasattr(self.backend, "force_focus"):
-                self.backend.force_focus()
-        except Exception:
-            pass
+            if self.backend: evs = self.backend.poll(0.0)
+        except Exception: evs = []
+        for raw, v in evs: self._apply_event(raw, v)
+
+        if self.backend_type and self.backend_type.startswith("pygame"):
+            try:
+                held = self.backend.get_pressed_state()
+                for k in list(self.ev_state.keys()): self.ev_state[k] = False
+                for raw in held:
+                    m = self.token_map.get(raw)
+                    if m: self.ev_state[m] = True; self._last_seen[m] = time.time()
+            except Exception: pass
+
+        now = time.time()
+        to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
+        for k in to_rel:
+            raw_equiv = None
+            for raw, mapped in self.token_map.items():
+                if mapped == k: raw_equiv = raw; break
+            if raw_equiv: self._apply_event(raw_equiv, 0)
+
+        curses_keys = {k: False for k in self.keys}
+        try:
+            while True:
+                k = stdscr.getch()
+                if k == -1: break
+                n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP', ord('r'):'RESET', ord('R'):'RESET',
+                    ord('q'):'QUIT', ord('Q'):'QUIT', ord('m'):'MENU', ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
+                if n: curses_keys[n] = True; self._apply_event(n, 1)
+        except Exception: pass
+        for k in self.keys: self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
     def _apply_event(self, raw, value):
         mapped = self.token_map.get(raw)
@@ -374,73 +363,14 @@ class InputEngine:
         prev = bool(self.ev_state.get(mapped, False))
         if value == 1:
             if not prev: self.pressed.add(mapped)
-            self.ev_state[mapped] = True
-            self._last_seen[mapped] = time.time()
-        else:
-            self.ev_state[mapped] = False
-            self._last_seen.pop(mapped, None)
-
-    def update(self, stdscr):
-        evs = []
-        try:
-            if self.backend:
-                evs = self.backend.poll(0.0)
-        except Exception:
-            evs = []
-        for raw, v in evs:
-            self._apply_event(raw, v)
-
-        # sync pygame backend held-set to ev_state to ensure continuous down() works
-        if self.backend_type and self.backend_type.startswith("pygame"):
-            try:
-                held = self.backend.get_pressed_state()
-                for k in list(self.ev_state.keys()): self.ev_state[k] = False
-                for raw in held:
-                    m = self.token_map.get(raw)
-                    if m:
-                        self.ev_state[m] = True
-                        self._last_seen[m] = time.time()
-            except Exception:
-                pass
-
-        # release by timeout
-        now = time.time()
-        to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
-        for k in to_rel:
-            raw_equiv = None
-            for raw, mapped in self.token_map.items():
-                if mapped == k:
-                    raw_equiv = raw; break
-            if raw_equiv:
-                self._apply_event(raw_equiv, 0)
-
-        # curses fallback for menu input
-        curses_keys = {k: False for k in self.keys}
-        try:
-            while True:
-                k = stdscr.getch()
-                if k == -1: break
-                n = {
-                    curses.KEY_LEFT: 'LEFT', curses.KEY_RIGHT: 'RIGHT',
-                    ord(' '): 'JUMP', ord('r'): 'RESET', ord('R'): 'RESET',
-                    ord('q'): 'QUIT', ord('Q'): 'QUIT', ord('m'): 'MENU',
-                    ord('M'): 'MENU', 10: 'CONTINUE', 13: 'CONTINUE'
-                }.get(k)
-                if n:
-                    curses_keys[n] = True
-                    self._apply_event(n, 1)
-        except Exception:
-            pass
-
-        for k in self.keys:
-            self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
+            self.ev_state[mapped] = True; self._last_seen[mapped] = time.time()
+        else: self.ev_state[mapped] = False; self._last_seen.pop(mapped, None)
 
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
     def reset(self):
-        for kk in self.keys:
-            self.keys[kk] = False; self.ev_state[kk] = False
+        for kk in self.keys: self.keys[kk] = False; self.ev_state[kk] = False
         self.pressed.clear(); self._last_seen.clear()
     def stop(self):
         try:
@@ -449,7 +379,7 @@ class InputEngine:
                 except: pass
         except: pass
 
-# --- game objects & helpers (condensed, unchanged logic) ---
+# --- game objects & helpers (condensed) ---
 class Platform:
     def __init__(self, d, start_t=0.0):
         self.ox, self.oy, self.w = d['x'], d['y'], d['w']
@@ -460,8 +390,7 @@ class Platform:
     def update(self, dt):
         self.t += dt * self.spd
         if self.ease == 'SINE': off = math.sin(self.t)
-        else:
-            norm = (self.t / math.pi) % 2; off = norm - 1 if norm > 1 else 1 - norm
+        else: norm = (self.t / math.pi) % 2; off = norm - 1 if norm > 1 else 1 - norm
         self.x = self.ox + (off * (self.lx / 2)); self.y = self.oy + (off * (self.ly / 2))
     def rect(self): return (self.x, self.y, self.x + self.w, self.y + 1)
 
@@ -493,8 +422,7 @@ def is_solid(grid,x,y):
         p = get_plugin(ch)
         if p and 'runtime' in p:
             s = p['runtime'].get('solid')
-            if callable(s): return bool(s(grid,x,y))
-            return bool(s)
+            if callable(s): return bool(s(grid,x,y)); return bool(s)
         return ch == TILES['SOLID']
     return True
 
@@ -565,27 +493,39 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-def show_in_game_menu(stdscr, allow_save=True):
+def show_in_game_menu(stdscr, inp, allow_save=True):
+    # Enable Standard Menu Mode (Release Grab)
+    inp.set_menu_mode(True)
+    stdscr.nodelay(False) # Blocking input for menus (standard curses)
+
     opts=["Resume"]
     if allow_save: opts.extend(["Save & Quit to Menu","Save Position (Slot)","Clear Slot Data"])
     quit_txt = "Quit (Progress Lost)" if SPEEDRUN_MODE else "Quit to Menu (No Save)"; opts.extend([quit_txt,"Cancel"])
-    idx=0; stdscr.nodelay(False)
+    idx=0; ret_val = "RESUME"
+
     while True:
-        draw_centered_menu(stdscr,"PAUSE MENU",opts,idx); k=stdscr.getch()
+        draw_centered_menu(stdscr,"PAUSE MENU",opts,idx)
+        k=stdscr.getch() # Uses standard curses input now
         if k==curses.KEY_UP: idx=(idx-1)%len(opts)
         elif k==curses.KEY_DOWN: idx=(idx+1)%len(opts)
         elif k in (10,13):
-            sel=opts[idx]; stdscr.nodelay(True)
-            if sel=="Resume": return "RESUME"
-            if sel=="Save & Quit to Menu": return "SAVE_QUIT"
-            if sel==quit_txt: return "QUIT_NO_SAVE"
-            if sel=="Save Position (Slot)": return "SAVE_ONLY"
-            if sel=="Clear Slot Data": return "CLEAR_SLOT"
-            return "CANCEL"
-        elif k in (ord('m'),ord('M'),ord('q'),ord('Q')): stdscr.nodelay(True); return "RESUME"
+            sel=opts[idx]
+            if sel=="Resume": ret_val="RESUME"; break
+            if sel=="Save & Quit to Menu": ret_val="SAVE_QUIT"; break
+            if sel==quit_txt: ret_val="QUIT_NO_SAVE"; break
+            if sel=="Save Position (Slot)": ret_val="SAVE_ONLY"; break
+            if sel=="Clear Slot Data": ret_val="CLEAR_SLOT"; break
+            ret_val="CANCEL"; break
+        elif k in (ord('m'),ord('M'),ord('q'),ord('Q')): ret_val="RESUME"; break
 
-def arcade_name_entry(stdscr,total_time):
-    stdscr.nodelay(False); name=""
+    stdscr.nodelay(True)
+    inp.set_menu_mode(False) # Restore Game Mode (Grab)
+    return ret_val
+
+def arcade_name_entry(stdscr, inp, total_time):
+    inp.set_menu_mode(True)
+    stdscr.nodelay(False)
+    name=""
     while True:
         stdscr.erase(); h,w=stdscr.getmaxyx(); cy,cx = h//2, w//2
         stdscr.addstr(cy-5, cx-len("★ CONGRATULATIONS! ★")//2, "★ CONGRATULATIONS! ★", curses.A_BOLD)
@@ -594,11 +534,17 @@ def arcade_name_entry(stdscr,total_time):
         field = f" {name} " + ("█" if (int(time.time()*2)%2)==0 else " "); stdscr.addstr(cy+1, cx-len(field)//2, field, curses.A_REVERSE)
         stdscr.addstr(cy+3, cx-13, "TYPE NAME - ENTER TO SUBMIT", curses.A_DIM); stdscr.refresh()
         k=stdscr.getch()
-        if k in (10,13): return name if len(name)>0 else "AAA"
+        if k in (10,13):
+            if len(name)>0: break
+            else: name="AAA"; break
         if k in (curses.KEY_BACKSPACE,127,8): name=name[:-1]
         elif 32<=k<=126 and len(name)<10: name += chr(k).upper()
 
-# --- main play loop (same behavior) ---
+    stdscr.nodelay(True)
+    inp.set_menu_mode(False)
+    return name
+
+# --- main play loop ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
     p_timers=[]; plugin_data={}
@@ -623,25 +569,19 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
     cx,cy=0,0; fps_h=deque(maxlen=30); start=time.time(); last=time.time(); cur_t=0.0; msg=None; mend=0
     ap=None; ap_off=0.0; stdscr.nodelay(True)
 
-    # ensure focus while we play
-    try:
-        if hasattr(inp, "force_focus"): inp.force_focus()
-    except: pass
+    # ensure focus at start
+    if hasattr(inp, 'set_menu_mode'): inp.set_menu_mode(False)
 
     def make_game_state(): return {"grid":grid,"platforms":plats,"level":title,"meta":meta}
     while True:
         inp.update(stdscr)
         if inp.was('MENU') or inp.was('QUIT'):
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset+cur_t, level_num, title)
-            choice = show_in_game_menu(stdscr, allow_save=allow_save)
+            # Pass inp so menu can release focus
+            choice = show_in_game_menu(stdscr, inp, allow_save=allow_save)
 
             if choice in ("RESUME","CANCEL"):
                 inp.clear(); last=time.time()
-                # reassert focus right after leaving menu
-                try:
-                    if hasattr(inp, "force_focus"): inp.force_focus()
-                except: pass
-
             elif choice == "SAVE_ONLY":
                 if SAVE_SLOT_PATH:
                     save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
@@ -649,18 +589,10 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     save_game_state_to(SAVE_SLOT_PATH, save); msg="SAVED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
                 inp.clear(); last=time.time()
-                try:
-                    if hasattr(inp, "force_focus"): inp.force_focus()
-                except: pass
-
             elif choice == "CLEAR_SLOT":
                 if SAVE_SLOT_PATH: clear_slot(SAVE_SLOT_PATH); msg="SLOT CLEARED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
                 inp.clear(); last=time.time()
-                try:
-                    if hasattr(inp, "force_focus"): inp.force_focus()
-                except: pass
-
             elif choice == "SAVE_QUIT":
                 if SAVE_SLOT_PATH:
                     save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
@@ -788,7 +720,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         draw_scene(stdscr, grid, plats, px, rpy, int(cx), int(cy), sum(fps_h)/len(fps_h), msg, t_offset+cur_t, level_num, title)
         time.sleep(0.005)
 
-# --- entry / args (compact) ---
+# --- entry / args ---
 def main(stdscr):
     global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
     locale.setlocale(locale.LC_ALL, '')
@@ -829,7 +761,7 @@ def main(stdscr):
                     if SAVE_SLOT_PATH:
                         if SPEEDRUN_MODE: clear_slot(SAVE_SLOT_PATH)
                         else: save_game_state_to(SAVE_SLOT_PATH, {"level_num":1,"completed":True})
-                    if SPEEDRUN_MODE: player_name=arcade_name_entry(stdscr, tot_t); save_score("speedrun_camp", tot_t, player_name)
+                    if SPEEDRUN_MODE: player_name=arcade_name_entry(stdscr, inp, tot_t); save_score("speedrun_camp", tot_t, player_name)
                     else: save_score("campaign", tot_t, "Player")
                     stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, f"DONE! TIME: {tot_t:.2f}s", curses.A_BOLD); stdscr.refresh(); time.sleep(3)
                 elif mode=="CAMP":
@@ -842,8 +774,7 @@ def main(stdscr):
             if res=="NEXT_LEVEL":
                 stdscr.erase(); stdscr.addstr(curses.LINES//2, (curses.COLS-20)//2, "LEVEL COMPLETE!", curses.A_BOLD); stdscr.refresh(); time.sleep(0.6)
                 tot_t += el; lvl += 1
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt: pass
     finally:
         if inp: inp.stop()
 
