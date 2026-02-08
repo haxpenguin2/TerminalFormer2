@@ -106,70 +106,151 @@ class EvdevBackend:
             try: d.close()
             except: pass
 
-# --- PYGAME SHIM (tiny invisible focused window) ---
+# ---- Replace your existing PygameBackend class with this ----
 class PygameBackend:
     def __init__(self):
-        self.active=False; self._held=set(); self._last_focus=0; self._focus_interval=0.25
+        self.active = False
+        self._held = set()
+        self._last_focus = 0
+        self._focus_interval = 0.25
+        self._x11_display = None
+        self._x11_grabbed = False
         try:
-            import os as _os; _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "-100,-100")
+            import os as _os
+            _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "-100,-100")
             import pygame as pg
-            self.pg=pg; pg.init()
+            self.pg = pg
+            pg.init()
             flags = pg.NOFRAME
-            try: self.screen = pg.display.set_mode((1,1), flags)
-            except: self.screen = pg.display.set_mode((1,1))
+            try:
+                # tiny, no-frame window
+                self.screen = pg.display.set_mode((1, 1), flags)
+            except Exception:
+                self.screen = pg.display.set_mode((1, 1))
             pg.display.set_caption("tf-input")
             try: pg.event.set_grab(True)
             except: pass
             try: pg.mouse.set_visible(False)
             except: pass
+
             self.map = {
-                pg.K_LEFT:"LEFT", pg.K_RIGHT:"RIGHT", pg.K_UP:"UP", pg.K_DOWN:"DOWN",
-                pg.K_SPACE:"SPACE", pg.K_RETURN:"CONTINUE", pg.K_KP_ENTER:"CONTINUE",
-                pg.K_q:"Q", pg.K_r:"R", pg.K_m:"M",
-                pg.K_w:"W", pg.K_a:"A", pg.K_s:"S", pg.K_d:"D", pg.K_z:"Z",
-                pg.K_h:"H"
+                pg.K_LEFT: "LEFT", pg.K_RIGHT: "RIGHT", pg.K_UP: "UP", pg.K_DOWN: "DOWN",
+                pg.K_SPACE: "SPACE", pg.K_RETURN: "CONTINUE", pg.K_KP_ENTER: "CONTINUE",
+                pg.K_q: "Q", pg.K_r: "R", pg.K_m: "M",
+                pg.K_w: "W", pg.K_a: "A", pg.K_s: "S", pg.K_d: "D", pg.K_z: "Z",
+                pg.K_h: "H"
             }
-            self.active=True
+
+            # Try to grab keyboard at X11 level so key events are delivered even if terminal is focused.
+            try:
+                wm = pg.display.get_wm_info()
+                win = wm.get("window") or wm.get("windowid") or wm.get("xwindow") or None
+                if win:
+                    # attempt to open X display and XGrabKeyboard
+                    try:
+                        x11 = ctypes.CDLL("libX11.so.6")
+                        x11.XOpenDisplay.argtypes = [c_char_p]; x11.XOpenDisplay.restype = ctypes.c_void_p
+                        disp = x11.XOpenDisplay(None)
+                        if disp:
+                            # XGrabKeyboard(Display *display, Window grab_window, Bool owner_events,
+                            #                int pointer_mode, int keyboard_mode, Time time)
+                            # GrabModeAsync == 1, CurrentTime == 0
+                            GrabModeAsync = 1
+                            CurrentTime = 0
+                            # arg types
+                            x11.XGrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+                            x11.XGrabKeyboard.restype = ctypes.c_int
+                            # call
+                            status = x11.XGrabKeyboard(disp, ctypes.c_ulong(win), ctypes.c_int(1), ctypes.c_int(GrabModeAsync), ctypes.c_int(GrabModeAsync), ctypes.c_ulong(CurrentTime))
+                            if status == 0:  # Success is typically 0
+                                self._x11_display = disp
+                                self._x11 = x11
+                                self._x11_grabbed = True
+                    except Exception:
+                        # ignore grab failure silently; we still work via event polling
+                        self._x11_display = None
+                        self._x11_grabbed = False
+            except Exception:
+                pass
+
+            self.active = True
         except Exception:
-            self.active=False
+            self.active = False
 
     def poll(self, timeout=0.0):
-        if not self.active: return []
-        evs=[]
-        pg=self.pg
+        if not self.active:
+            return []
+        evs = []
+        pg = self.pg
         try:
             for e in pg.event.get():
-                if e.type==pg.KEYDOWN:
-                    raw=self.map.get(e.key)
+                if e.type == pg.KEYDOWN:
+                    raw = self.map.get(e.key)
                     if raw and raw not in self._held:
-                        self._held.add(raw); evs.append((raw,1))
-                elif e.type==pg.KEYUP:
-                    raw=self.map.get(e.key)
+                        self._held.add(raw)
+                        evs.append((raw, 1))
+                elif e.type == pg.KEYUP:
+                    raw = self.map.get(e.key)
                     if raw and raw in self._held:
-                        self._held.remove(raw); evs.append((raw,0))
+                        self._held.remove(raw)
+                        evs.append((raw, 0))
         except Exception:
-            try: pg.event.pump()
-            except: pass
-        now=time.time()
-        if now-self._last_focus>self._focus_interval:
-            self._last_focus=now
             try:
-                if not pg.key.get_focused():
-                    try: pg.event.set_grab(True)
-                    except: pass
-                    try: pg.display.flip()
-                    except: pass
-            except: pass
+                pg.event.pump()
+            except:
+                pass
+
+        # occasionally ensure grab (best-effort)
+        now = time.time()
+        if now - self._last_focus > self._focus_interval:
+            self._last_focus = now
+            try:
+                # re-assert SDL grab (helps in some envs)
+                try: pg.event.set_grab(True)
+                except: pass
+                try: pg.display.flip()
+                except: pass
+            except:
+                pass
+
         return evs
 
-    def get_pressed_state(self): return set(self._held)
+    def get_pressed_state(self):
+        # return copy to avoid mutation races
+        return set(self._held)
+
     def close(self):
-        if not getattr(self,"active",False): return
-        try: self.pg.event.set_grab(False)
-        except: pass
-        try: self.pg.quit()
-        except: pass
-        self.active=False
+        # release X grab if we obtained it
+        try:
+            if getattr(self, "_x11_grabbed", False) and getattr(self, "_x11_display", None):
+                try:
+                    # int XUngrabKeyboard(Display *display, Time time)
+                    self._x11.XUngrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                    self._x11.XUngrabKeyboard.restype = None
+                    self._x11.XUngrabKeyboard(self._x11_display, ctypes.c_ulong(0))
+                except:
+                    pass
+                try:
+                    self._x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+                    self._x11.XCloseDisplay(self._x11_display)
+                except:
+                    pass
+                self._x11_grabbed = False
+                self._x11_display = None
+        except:
+            pass
+        if not getattr(self, "active", False):
+            return
+        try:
+            self.pg.event.set_grab(False)
+        except:
+            pass
+        try:
+            self.pg.quit()
+        except:
+            pass
+        self.active = False
+# ---- end replacement ----
 
 # --- INPUT ENGINE (only evdev or pygame backend) ---
 class InputEngine:
