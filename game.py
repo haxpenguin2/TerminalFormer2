@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-# TerminalFormer2 - compacted input: evdev (if /dev/input) else pygame shim
+# TerminalFormer2 - single-file input (evdev else pygame+XQueryKeymap) + game logic
 import curses, time, os, math, sys, json, glob, importlib.util, select
-import ctypes, locale
+import ctypes, locale, traceback
 from collections import deque
-from ctypes import c_void_p, c_char_p, c_uint, create_string_buffer, c_ubyte
+from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
 # --- CONFIG ---
 GRAVITY, JUMP_V, MOVE_SPEED = 90.0, -28.0, 24.0
 FPS, MAX_SUBSTEP, DT = 60.0, 0.02, 1.0 / 60.0
-DIRS = {'LEVELS':"levels",'CAMP':"campaignlevels",'SCORES':"scores.json",'PLUGINS':"plugins"}
-TILES = {'SOLID':'█','SPIKE':'▲','SPIKE_DN':'▼','CP':'C','SPAWN':'S','GOAL':'G','PLAYER':'#'}
-PHYS = {'HW':0.4,'HH':0.5,'TOL':0.001}
-for d in [DIRS['LEVELS'], DIRS['CAMP'], DIRS['PLUGINS']]: os.makedirs(d, exist_ok=True)
+DIRS = {'LEVELS': "levels", 'CAMP': "campaignlevels", 'SCORES': "scores.json", 'PLUGINS': "plugins"}
+TILES = {'SOLID': '█', 'SPIKE': '▲', 'SPIKE_DN': '▼', 'CP': 'C', 'SPAWN': 'S', 'GOAL': 'G', 'PLAYER': '#'}
+PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
+for d in [DIRS['LEVELS'], DIRS['CAMP'], DIRS['PLUGINS']]:
+    os.makedirs(d, exist_ok=True)
 
-# --- plugins (unchanged logic but compact) ---
+# --- plugin loader (compact) ---
 REGISTRY = {}; PLUGINS = []
 def load_plugins():
     for p in glob.glob(os.path.join(DIRS['PLUGINS'], "*.py")):
@@ -27,35 +28,38 @@ def load_plugins():
                     if not isinstance(mm, dict): continue
                     ch = mm.get("char") or mm.get("id")
                     PLUGINS.append(mm)
-                    if isinstance(ch, str) and len(ch) == 1: REGISTRY[ch] = mm
+                    if isinstance(ch, str) and len(ch) == 1:
+                        REGISTRY[ch] = mm
         except Exception:
             pass
 load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
-# --- scores / save helpers (kept minimal) ---
+# --- scores / save helpers ---
 SAVE_SLOT_PATH = None; RESUME_FLAG = False; SPEEDRUN_MODE = False
 def save_score(cat, val, name="Player"):
     data = {}
     try:
-        if os.path.exists(DIRS['SCORES']): data = json.load(open(DIRS['SCORES']))
+        if os.path.exists(DIRS['SCORES']):
+            with open(DIRS['SCORES'], 'r') as f: data = json.load(f)
     except: data = {}
     entries = data.get(cat, [])
     entries = [{"name":"UNK","time":x} if isinstance(x,(int,float)) else x for x in entries]
     entries.append({"name":name,"time":val}); entries.sort(key=lambda x:x["time"]); data[cat]=entries[:10]
-    try: json.dump(data, open(DIRS['SCORES'],"w"))
+    try: open(DIRS['SCORES'],"w").write(json.dumps(data))
     except: pass
 
 def save_game_state_to(path, state):
     try:
         tmp = path + ".tmp"
-        json.dump(state, open(tmp,"w"))
+        open(tmp, "w").write(json.dumps(state))
         os.replace(tmp, path)
     except: pass
 
 def load_saved_game_from(path):
     try:
-        if path and os.path.exists(path): return json.load(open(path))
+        if path and os.path.exists(path):
+            return json.load(open(path))
     except: pass
     return None
 
@@ -64,7 +68,7 @@ def clear_slot(path):
         if path and os.path.exists(path): os.remove(path)
     except: pass
 
-# --- EVDEV BACKEND (used if /dev/input has event devices and evdev installed) ---
+# --- EVDEV BACKEND (native) ---
 class EvdevBackend:
     def __init__(self):
         try:
@@ -72,7 +76,7 @@ class EvdevBackend:
             devs = [InputDevice(p) for p in list_devices()]
             self.devices = [d for d in devs if ecodes.EV_KEY in d.capabilities()]
             self.fd_map = {d.fd: d for d in self.devices}
-            # map ecodes to raw tokens
+            self.ecodes = ecodes
             self.code_map = {
                 ecodes.KEY_LEFT:'LEFT', ecodes.KEY_RIGHT:'RIGHT',
                 ecodes.KEY_UP:'UP', ecodes.KEY_DOWN:'DOWN',
@@ -81,15 +85,15 @@ class EvdevBackend:
                 ecodes.KEY_Q:'Q', ecodes.KEY_H:'H', ecodes.KEY_ENTER:'CONTINUE',
                 ecodes.KEY_M:'M'
             }
-            self.ecodes = ecodes
-            if not self.devices: raise Exception("no evdev devices")
+            if not self.devices:
+                raise Exception("no evdev devices")
         except Exception:
             raise
 
     def poll(self, timeout=0.0):
         evs=[]
         try:
-            r,_,_ = select.select(self.fd_map.keys(), [], [], timeout)
+            r,_,_ = select.select(list(self.fd_map.keys()), [], [], timeout)
             for fd in r:
                 dev = self.fd_map.get(fd)
                 for ev in dev.read():
@@ -106,73 +110,76 @@ class EvdevBackend:
             try: d.close()
             except: pass
 
-# ---- Replace your existing PygameBackend class with this ----
+# --- PYGAME+X11 BACKEND (works in Crostini even if curses is focused) ---
 class PygameBackend:
+    """
+    Creates a tiny hidden pygame window (so SDL is happy) but polls X11's keyboard state
+    via XQueryKeymap to detect keys regardless of window focus. If X11 is unavailable,
+    it falls back to using pygame's event queue (requires focus).
+    """
     def __init__(self):
         self.active = False
         self._held = set()
+        self._last = set()
         self._last_focus = 0
         self._focus_interval = 0.25
-        self._x11_display = None
-        self._x11_grabbed = False
+        self._use_x11 = False
+        self._display = None
+        self._x11 = None
+        self._keycodes = {}
+        # map keysyms to tokens (use X11 KeySym numeric values)
+        self._syms = {
+            'LEFT': 0xFF51, 'RIGHT': 0xFF53, 'UP': 0xFF52, 'DOWN': 0xFF54,
+            'SPACE': 0x0020, 'Q': 0x0071, 'R': 0x0072, 'M': 0x006D,
+            'CONTINUE': 0xFF0D, 'W': 0x0077, 'A': 0x0061, 'S': 0x0073, 'D': 0x0064, 'Z': 0x007A, 'H': 0x0068
+        }
         try:
+            # create tiny window (offscreen if possible)
             import os as _os
             _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "-100,-100")
             import pygame as pg
             self.pg = pg
             pg.init()
-            flags = pg.NOFRAME
+            flags = pg.NOFRAME if hasattr(pg, 'NOFRAME') else 0
             try:
-                # tiny, no-frame window
-                self.screen = pg.display.set_mode((1, 1), flags)
-            except Exception:
-                self.screen = pg.display.set_mode((1, 1))
+                self.screen = pg.display.set_mode((1,1), flags)
+            except:
+                self.screen = pg.display.set_mode((1,1))
             pg.display.set_caption("tf-input")
             try: pg.event.set_grab(True)
             except: pass
             try: pg.mouse.set_visible(False)
             except: pass
 
-            self.map = {
-                pg.K_LEFT: "LEFT", pg.K_RIGHT: "RIGHT", pg.K_UP: "UP", pg.K_DOWN: "DOWN",
-                pg.K_SPACE: "SPACE", pg.K_RETURN: "CONTINUE", pg.K_KP_ENTER: "CONTINUE",
-                pg.K_q: "Q", pg.K_r: "R", pg.K_m: "M",
-                pg.K_w: "W", pg.K_a: "A", pg.K_s: "S", pg.K_d: "D", pg.K_z: "Z",
-                pg.K_h: "H"
-            }
-
-            # Try to grab keyboard at X11 level so key events are delivered even if terminal is focused.
+            # try X11 for keymap polling
             try:
-                wm = pg.display.get_wm_info()
-                win = wm.get("window") or wm.get("windowid") or wm.get("xwindow") or None
-                if win:
-                    # attempt to open X display and XGrabKeyboard
-                    try:
-                        x11 = ctypes.CDLL("libX11.so.6")
-                        x11.XOpenDisplay.argtypes = [c_char_p]; x11.XOpenDisplay.restype = ctypes.c_void_p
-                        disp = x11.XOpenDisplay(None)
-                        if disp:
-                            # XGrabKeyboard(Display *display, Window grab_window, Bool owner_events,
-                            #                int pointer_mode, int keyboard_mode, Time time)
-                            # GrabModeAsync == 1, CurrentTime == 0
-                            GrabModeAsync = 1
-                            CurrentTime = 0
-                            # arg types
-                            x11.XGrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
-                            x11.XGrabKeyboard.restype = ctypes.c_int
-                            # call
-                            status = x11.XGrabKeyboard(disp, ctypes.c_ulong(win), ctypes.c_int(1), ctypes.c_int(GrabModeAsync), ctypes.c_int(GrabModeAsync), ctypes.c_ulong(CurrentTime))
-                            if status == 0:  # Success is typically 0
-                                self._x11_display = disp
-                                self._x11 = x11
-                                self._x11_grabbed = True
-                    except Exception:
-                        # ignore grab failure silently; we still work via event polling
-                        self._x11_display = None
-                        self._x11_grabbed = False
+                x11 = ctypes.CDLL("libX11.so.6")
+                x11.XOpenDisplay.argtypes = [c_char_p]; x11.XOpenDisplay.restype = c_void_p
+                disp = x11.XOpenDisplay(None)
+                if disp:
+                    # set prototypes for functions we use
+                    x11.XKeysymToKeycode.argtypes = [c_void_p, ctypes.c_ulong]; x11.XKeysymToKeycode.restype = ctypes.c_uint
+                    x11.XQueryKeymap.argtypes = [c_void_p, c_char_p]
+                    x11.XQueryKeymap.restype = None
+                    # compute keycodes for syms
+                    keycodes = {}
+                    for name, sym in self._syms.items():
+                        try:
+                            code = x11.XKeysymToKeycode(disp, sym)
+                        except Exception:
+                            code = 0
+                        if code:
+                            keycodes[name] = int(code)
+                    # if we have at least arrow keys and space, consider X11 present
+                    if keycodes.get('LEFT') and keycodes.get('RIGHT'):
+                        self._use_x11 = True
+                        self._display = disp
+                        self._x11 = x11
+                        self._keycodes = keycodes
             except Exception:
-                pass
+                self._use_x11 = False
 
+            # if X11 isn't available, we'll fall back to pygame event queue.
             self.active = True
         except Exception:
             self.active = False
@@ -181,238 +188,284 @@ class PygameBackend:
         if not self.active:
             return []
         evs = []
-        pg = self.pg
-        try:
-            for e in pg.event.get():
-                if e.type == pg.KEYDOWN:
-                    raw = self.map.get(e.key)
-                    if raw and raw not in self._held:
-                        self._held.add(raw)
-                        evs.append((raw, 1))
-                elif e.type == pg.KEYUP:
-                    raw = self.map.get(e.key)
-                    if raw and raw in self._held:
-                        self._held.remove(raw)
-                        evs.append((raw, 0))
-        except Exception:
+        # If we have X11, use XQueryKeymap and detect transitions
+        if self._use_x11 and self._display and self._x11:
             try:
-                pg.event.pump()
-            except:
+                KeysArray = c_ubyte * 32
+                keys = KeysArray()
+                # cast to char* for XQueryKeymap
+                self._x11.XQueryKeymap(self._display, ctypes.cast(keys, c_char_p))
+                curr = set()
+                for name, code in self._keycodes.items():
+                    byte_idx = code // 8
+                    bit_idx = code % 8
+                    if byte_idx < 32:
+                        try:
+                            if (keys[byte_idx] & (1 << bit_idx)) != 0:
+                                curr.add(name)
+                        except Exception:
+                            pass
+                # produce events for transitions
+                for down in (curr - self._last):
+                    evs.append((down, 1))
+                for up in (self._last - curr):
+                    evs.append((up, 0))
+                self._last = curr
+                # also keep held set aligned for get_pressed_state
+                self._held = set(curr)
+            except Exception:
+                # fallback to pygame event processing below
                 pass
 
-        # occasionally ensure grab (best-effort)
+        # always still process pygame events (keeps SDL internal state sane)
+        try:
+            for e in self.pg.event.get():
+                if e.type == self.pg.KEYDOWN:
+                    raw = {v:k for k,v in self._syms.items()}.get(self._syms.get('W'))  # noop tweak to keep mapping place
+                    # map via key constant
+                    mapped = {
+                        self.pg.K_LEFT:"LEFT", self.pg.K_RIGHT:"RIGHT", self.pg.K_UP:"UP", self.pg.K_DOWN:"DOWN",
+                        self.pg.K_SPACE:"SPACE", self.pg.K_RETURN:"CONTINUE", self.pg.K_KP_ENTER:"CONTINUE",
+                        self.pg.K_q:"Q", self.pg.K_r:"R", self.pg.K_m:"M",
+                        self.pg.K_w:"W", self.pg.K_a:"A", self.pg.K_s:"S", self.pg.K_d:"D", self.pg.K_z:"Z",
+                        self.pg.K_h:"H"
+                    }.get(e.key)
+                    if mapped and mapped not in self._held:
+                        self._held.add(mapped); evs.append((mapped, 1))
+                elif e.type == self.pg.KEYUP:
+                    mapped = {
+                        self.pg.K_LEFT:"LEFT", self.pg.K_RIGHT:"RIGHT", self.pg.K_UP:"UP", self.pg.K_DOWN:"DOWN",
+                        self.pg.K_SPACE:"SPACE", self.pg.K_RETURN:"CONTINUE", self.pg.K_KP_ENTER:"CONTINUE",
+                        self.pg.K_q:"Q", self.pg.K_r:"R", self.pg.K_m:"M",
+                        self.pg.K_w:"W", self.pg.K_a:"A", self.pg.K_s:"S", self.pg.K_d:"D", self.pg.K_z:"Z",
+                        self.pg.K_h:"H"
+                    }.get(e.key)
+                    if mapped and mapped in self._held:
+                        try: self._held.remove(mapped)
+                        except: pass
+                        evs.append((mapped, 0))
+        except Exception:
+            try:
+                self.pg.event.pump()
+            except: pass
+
+        # best-effort reassert grab & flip occasionally (keeps SDL active)
         now = time.time()
         if now - self._last_focus > self._focus_interval:
             self._last_focus = now
             try:
-                # re-assert SDL grab (helps in some envs)
-                try: pg.event.set_grab(True)
+                try: self.pg.event.set_grab(True)
                 except: pass
-                try: pg.display.flip()
+                try: self.pg.display.flip()
                 except: pass
-            except:
-                pass
+            except: pass
 
         return evs
 
     def get_pressed_state(self):
-        # return copy to avoid mutation races
         return set(self._held)
 
     def close(self):
-        # release X grab if we obtained it
+        # ungrab X keyboard if needed
         try:
-            if getattr(self, "_x11_grabbed", False) and getattr(self, "_x11_display", None):
+            if getattr(self, "_use_x11", False) and getattr(self, "_x11", None) and getattr(self, "_display", None):
                 try:
-                    # int XUngrabKeyboard(Display *display, Time time)
-                    self._x11.XUngrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-                    self._x11.XUngrabKeyboard.restype = None
-                    self._x11.XUngrabKeyboard(self._x11_display, ctypes.c_ulong(0))
+                    # try XCloseDisplay (we didn't call XUngrabKeyboard explicitly)
+                    self._x11.XCloseDisplay.argtypes = [c_void_p]; self._x11.XCloseDisplay(self._display)
                 except:
                     pass
-                try:
-                    self._x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-                    self._x11.XCloseDisplay(self._x11_display)
-                except:
-                    pass
-                self._x11_grabbed = False
-                self._x11_display = None
+                self._display = None
+                self._x11 = None
+                self._use_x11 = False
         except:
             pass
-        if not getattr(self, "active", False):
-            return
+        if not getattr(self, "active", False): return
         try:
             self.pg.event.set_grab(False)
-        except:
-            pass
-        try:
-            self.pg.quit()
-        except:
-            pass
+        except: pass
+        try: self.pg.quit()
+        except: pass
         self.active = False
-# ---- end replacement ----
 
-# --- INPUT ENGINE (only evdev or pygame backend) ---
+# --- INPUT ENGINE (only evdev or pygame-backed XQueryKeymap) ---
 class InputEngine:
     def __init__(self, hold_timeout=0.6):
-        # public state
-        self.keys = {k:False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
-        self.pressed = set(); self.ev_state = {k:False for k in self.keys}; self._last_seen={}
-        self._hold_timeout=float(hold_timeout)
-        self.backend=None; self.backend_type=None
+        self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
+        self.pressed = set()
+        self.ev_state = {k: False for k in self.keys}
+        self._last_seen = {}
+        self._hold_timeout = float(hold_timeout)
+        self.backend = None
+        self.backend_type = None
 
-        # detection: prefer evdev if /dev/input/event* exists and evdev import works
+        # try evdev if event devices exist and import works
         try:
             has_events = False
             if os.path.isdir("/dev/input"):
                 for fn in os.listdir("/dev/input"):
-                    if fn.startswith("event"): has_events=True; break
+                    if fn.startswith("event"): has_events = True; break
             if has_events:
                 try:
-                    self.backend = EvdevBackend(); self.backend_type="evdev"
+                    self.backend = EvdevBackend(); self.backend_type = "evdev"
                 except Exception:
-                    self.backend=None
+                    self.backend = None
             if not self.backend:
-                # fallback to pygame shim
                 p = PygameBackend()
                 if p.active:
-                    self.backend = p; self.backend_type="pygame"
+                    self.backend = p; self.backend_type = "pygame-x11" if getattr(p, "_use_x11", False) else "pygame"
                 else:
-                    self.backend=None
+                    self.backend = None
         except Exception:
-            self.backend=None
+            self.backend = None
 
-        # token mapping raw->game
-        self.token_map = {'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
-                          'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
-                          'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
-                          'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'}
-
-        # debug
-        try:
-            print(f"InputEngine: backend={self.backend_type}", file=sys.stderr)
+        self.token_map = {
+            'LEFT':'LEFT','RIGHT':'RIGHT','UP':'JUMP','DOWN':'DOWN',
+            'SPACE':'JUMP','ENTER':'CONTINUE','CONTINUE':'CONTINUE',
+            'R':'RESET','Q':'QUIT','M':'MENU','A':'LEFT','D':'RIGHT',
+            'W':'JUMP','S':'DOWN','Z':'JUMP','H':'LEFT'
+        }
+        try: print(f"InputEngine: backend={self.backend_type}", file=sys.stderr)
         except: pass
 
-    def _apply_event(self, raw, val):
+    def _apply_event(self, raw, value):
         mapped = self.token_map.get(raw)
         if not mapped: return
         prev = bool(self.ev_state.get(mapped, False))
-        if val==1:
+        if value == 1:
             if not prev: self.pressed.add(mapped)
-            self.ev_state[mapped]=True; self._last_seen[mapped]=time.time()
+            self.ev_state[mapped] = True
+            self._last_seen[mapped] = time.time()
         else:
-            self.ev_state[mapped]=False
+            self.ev_state[mapped] = False
             self._last_seen.pop(mapped, None)
 
     def update(self, stdscr):
-        # poll backend events
-        evs=[]
+        evs = []
         try:
             if self.backend:
                 evs = self.backend.poll(0.0)
         except Exception:
-            evs=[]
-        for raw,v in evs: self._apply_event(raw, v)
+            evs = []
+        for raw, v in evs:
+            self._apply_event(raw, v)
 
-        # if pygame backend, also sync held-set -> ev_state (ensures continuous down())
-        if self.backend_type=="pygame":
+        # sync pygame backend held-set to ev_state to ensure continuous down() works
+        if self.backend_type and self.backend_type.startswith("pygame"):
             try:
                 held = self.backend.get_pressed_state()
-                # zero-out then set
-                for k in list(self.ev_state.keys()): self.ev_state[k]=False
+                # clear then set to reflect held keys
+                for k in list(self.ev_state.keys()):
+                    self.ev_state[k] = False
                 for raw in held:
                     m = self.token_map.get(raw)
                     if m:
-                        self.ev_state[m]=True; self._last_seen[m]=time.time()
+                        self.ev_state[m] = True
+                        self._last_seen[m] = time.time()
             except Exception:
                 pass
 
-        # releases by timeout (safety for weird envs)
-        now=time.time()
-        to_rel=[k for k,ts in list(self._last_seen.items()) if now-ts>self._hold_timeout]
+        # release by timeout
+        now = time.time()
+        to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
         for k in to_rel:
-            self._apply_event(next((r for r,t in self.token_map.items() if t==k), k), 0)
+            # find any raw token mapping to k
+            raw_equiv = None
+            for raw, mapped in self.token_map.items():
+                if mapped == k:
+                    raw_equiv = raw; break
+            if raw_equiv:
+                self._apply_event(raw_equiv, 0)
 
-        # curses nav fallback (menu navigation still works)
-        curses_keys={k:False for k in self.keys}
+        # curses fallback for menu input
+        curses_keys = {k: False for k in self.keys}
         try:
             while True:
                 k = stdscr.getch()
-                if k==-1: break
-                n = {curses.KEY_LEFT:'LEFT', curses.KEY_RIGHT:'RIGHT', ord(' '):'JUMP', ord('r'):'RESET',
-                     ord('R'):'RESET', ord('q'):'QUIT', ord('Q'):'QUIT', ord('m'):'MENU',
-                     ord('M'):'MENU', 10:'CONTINUE', 13:'CONTINUE'}.get(k)
+                if k == -1: break
+                n = {
+                    curses.KEY_LEFT: 'LEFT', curses.KEY_RIGHT: 'RIGHT',
+                    ord(' '): 'JUMP', ord('r'): 'RESET', ord('R'): 'RESET',
+                    ord('q'): 'QUIT', ord('Q'): 'QUIT', ord('m'): 'MENU',
+                    ord('M'): 'MENU', 10: 'CONTINUE', 13: 'CONTINUE'
+                }.get(k)
                 if n:
-                    curses_keys[n]=True; self._apply_event(n,1)
+                    curses_keys[n] = True
+                    self._apply_event(n, 1)
         except Exception:
             pass
 
-        # publish continuous keys
-        for k in self.keys: self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
+        for k in self.keys:
+            self.keys[k] = bool(self.ev_state.get(k, False)) or curses_keys.get(k, False)
 
-    def was(self,k): return k in self.pressed
-    def down(self,k): return bool(self.keys.get(k, False))
+    def was(self, k): return k in self.pressed
+    def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
     def reset(self):
-        for kk in self.keys: self.keys[kk]=False; self.ev_state[kk]=False
+        for kk in self.keys:
+            self.keys[kk] = False; self.ev_state[kk] = False
         self.pressed.clear(); self._last_seen.clear()
     def stop(self):
         try:
-            if getattr(self,"backend",None):
+            if getattr(self, "backend", None):
                 try: self.backend.close()
                 except: pass
         except: pass
 
-# --- rest of game (kept same but compacted where sensible) ---
+# --- game objects & helpers (condensed, unchanged logic) ---
 class Platform:
-    def __init__(self,d,start_t=0.0):
-        self.ox,self.oy,self.w = d['x'],d['y'],d['w']; self.lx=d.get('lx',0); self.ly=d.get('ly',0)
-        self.spd=d.get('spd',1.0); self.ease=d.get('ease','SINE'); self.x,self.y,self.t=self.ox,self.oy,start_t
+    def __init__(self, d, start_t=0.0):
+        self.ox, self.oy, self.w = d['x'], d['y'], d['w']
+        self.lx = d.get('lx', 0); self.ly = d.get('ly', 0)
+        self.spd = d.get('spd', 1.0); self.ease = d.get('ease', 'SINE')
+        self.x, self.y, self.t = self.ox, self.oy, start_t
         self.update(0)
-    def update(self,dt):
-        self.t += dt*self.spd
-        if self.ease=='SINE': off=math.sin(self.t)
+    def update(self, dt):
+        self.t += dt * self.spd
+        if self.ease == 'SINE': off = math.sin(self.t)
         else:
-            norm=(self.t/math.pi)%2; off = norm-1 if norm>1 else 1-norm
-        self.x=self.ox+(off*(self.lx/2)); self.y=self.oy+(off*(self.ly/2))
-    def rect(self): return (self.x,self.y,self.x+self.w,self.y+1)
+            norm = (self.t / math.pi) % 2; off = norm - 1 if norm > 1 else 1 - norm
+        self.x = self.ox + (off * (self.lx / 2)); self.y = self.oy + (off * (self.ly / 2))
+    def rect(self): return (self.x, self.y, self.x + self.w, self.y + 1)
+
+def load_plugins(): pass  # already loaded above (kept for compatibility)
 
 def load_level(path, platform_timers=None):
-    if not os.path.exists(path): return None,[], "UNKNOWN", {}
-    with open(path) as f: parts=f.read().split("__METADATA__")
-    lines=[l.rstrip("\r\n") for l in parts[0].strip().split('\n') if l!=""]
-    w=max((len(l) for l in lines), default=0); grid=[list(l.ljust(w,' ')) for l in lines]
-    plats=[]; title=os.path.splitext(os.path.basename(path))[0]; meta={}
-    if len(parts)>1:
+    if not os.path.exists(path): return None, [], "UNKNOWN", {}
+    with open(path) as f: parts = f.read().split("__METADATA__")
+    lines = [l.rstrip("\r\n") for l in parts[0].strip().split('\n') if l != ""]
+    w = max((len(l) for l in lines), default=0); grid = [list(l.ljust(w,' ')) for l in lines]
+    plats = []; title = os.path.splitext(os.path.basename(path))[0]; meta = {}
+    if len(parts) > 1:
         try:
-            d=json.loads(parts[1])
-            if isinstance(d,dict):
-                meta=d; title=str(d.get("title",title)).replace('"','')
-                for i,p in enumerate(d.get("platforms",[])):
-                    t_start = platform_timers[i] if platform_timers and i<len(platform_timers) else 0.0
-                    mp = Platform(p,t_start); plats.append(mp)
+            d = json.loads(parts[1])
+            if isinstance(d, dict):
+                meta = d; title = str(d.get("title", title)).replace('"','')
+                for i,p in enumerate(d.get("platforms", [])):
+                    t_start = platform_timers[i] if platform_timers and i < len(platform_timers) else 0.0
+                    mp = Platform(p, t_start); plats.append(mp)
                     for j in range(p['w']):
                         gy,gx = int(p['y']), int(p['x'])+j
-                        if 0<=gy<len(grid) and 0<=gx<len(grid[0]): grid[gy][gx]=' '
+                        if 0 <= gy < len(grid) and 0 <= gx < len(grid[0]): grid[gy][gx] = ' '
         except: pass
     return grid, plats, title, meta
 
+def get_plugin(ch): return REGISTRY.get(ch)
 def is_solid(grid,x,y):
     if 0<=y<len(grid) and 0<=x<len(grid[0]):
-        ch=grid[int(y)][int(x)]
+        ch = grid[int(y)][int(x)]
         if ch in ('C','S','G',' '): return False
-        p=get_plugin(ch)
+        p = get_plugin(ch)
         if p and 'runtime' in p:
-            s=p['runtime'].get('solid')
+            s = p['runtime'].get('solid')
             if callable(s): return bool(s(grid,x,y))
             return bool(s)
-        return ch==TILES['SOLID']
+        return ch == TILES['SOLID']
     return True
 
 def check_rect(grid,l,t,r,b):
     for yy in range(int(math.floor(t)), int(math.floor(b))+1):
         for xx in range(int(math.floor(l)), int(math.floor(r))+1):
-            if is_solid(grid,xx,yy): return True
+            if is_solid(grid, xx, yy): return True
     return False
 
 def check_plat(plats,l,t,r,b):
@@ -422,7 +475,7 @@ def check_plat(plats,l,t,r,b):
     return None
 
 def resolve_char(grid,plats,cx,cy,title,default):
-    p=get_plugin(default)
+    p = get_plugin(default)
     if p:
         rt,ed = p.get('runtime',{}), p.get('editor',{})
         if callable(rt.get('get_display_char')):
@@ -434,26 +487,26 @@ def resolve_char(grid,plats,cx,cy,title,default):
 def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, ltitle, vis=True):
     h,w = stdscr.getmaxyx(); stdscr.erase()
     gh,gw = len(grid), len(grid[0]) if grid else 0
-    ox = (w-gw)//2 if gw<w else 0; oy=(h-gh)//2 if gh<h else 0
-    sx = int(max(0,min(cx,max(0,gw-w)))) if gw>=w else 0
-    sy = int(max(0,min(cy,max(0,gh-h)))) if gh>=h else 0
+    ox = (w-gw)//2 if gw < w else 0; oy = (h-gh)//2 if gh < h else 0
+    sx = int(max(0,min(cx,max(0,gw-w)))) if gw >= w else 0
+    sy = int(max(0,min(cy,max(0,gh-h)))) if gh >= h else 0
     for scr_y in range(h):
-        my = scr_y-oy+sy
-        if 0<=my<gh:
-            row=grid[my]; sl=min(sx+w,len(row))
-            if sx<sl:
-                ln="".join([str(resolve_char(grid,plats,x,my,ltitle,row[x])) for x in range(sx,sl)])
-                try: stdscr.addstr(scr_y, max(0,ox), ln)
+        my = scr_y - oy + sy
+        if 0 <= my < gh:
+            row = grid[my]; sl = min(sx+w, len(row))
+            if sx < sl:
+                ln = "".join([str(resolve_char(grid,plats,x,my,ltitle,row[x])) for x in range(sx,sl)])
+                try: stdscr.addstr(scr_y, max(0, ox), ln)
                 except: pass
     for p in plats:
-        spx,spy = int(p.x-sx)+ox, int(p.y-sy)+oy
-        if 0<=spy<h:
-            dl = min(w-spx, p.w + (spx if spx<0 else 0))
-            if dl>0:
-                try: stdscr.addstr(spy, max(0,spx), TILES['SOLID']*int(dl), curses.A_BOLD)
+        spx, spy = int(p.x - sx) + ox, int(p.y - sy) + oy
+        if 0 <= spy < h:
+            dl = min(w - spx, p.w + (spx if spx < 0 else 0))
+            if dl > 0:
+                try: stdscr.addstr(spy, max(0, spx), TILES['SOLID'] * int(dl), curses.A_BOLD)
                 except: pass
-    spx,spy=int(px-sx)+ox,int(py-sy)+oy
-    if vis and 0<=spx<w and 0<=spy<h:
+    spx, spy = int(px - sx) + ox, int(py - sy) + oy
+    if vis and 0 <= spx < w and 0 <= spy < h:
         try: stdscr.addch(spy, spx, TILES['PLAYER'], curses.A_BOLD)
         except: pass
     try:
@@ -465,11 +518,11 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
     stdscr.refresh()
 
 def draw_centered_menu(stdscr,title,opts,sel):
-    h,w=stdscr.getmaxyx(); box_w=max(40,min(60,max(len(title)+4, max((len(o)+6) for o in opts))))
-    box_h=len(opts)+4; bx=(w-box_w)//2; by=(h-box_h)//2
+    h,w = stdscr.getmaxyx(); box_w = max(40, min(60, max(len(title)+4, max((len(o)+6) for o in opts))))
+    box_h = len(opts)+4; bx=(w-box_w)//2; by=(h-box_h)//2
     try:
-        for y in range(by,by+box_h): stdscr.addstr(y,bx," "*box_w)
-        stdscr.attron(curses.A_BOLD|curses.A_UNDERLINE); stdscr.addstr(by,bx+2,title); stdscr.attroff(curses.A_BOLD|curses.A_UNDERLINE)
+        for y in range(by, by+box_h): stdscr.addstr(y, bx, " "*box_w)
+        stdscr.attron(curses.A_BOLD|curses.A_UNDERLINE); stdscr.addstr(by, bx+2, title); stdscr.attroff(curses.A_BOLD|curses.A_UNDERLINE)
         for i,it in enumerate(opts):
             txt = f"> {it} <" if i==sel else f"   {it}   "; attr = curses.A_REVERSE if i==sel else curses.A_NORMAL
             stdscr.addstr(by+2+i, bx+2, txt, attr)
@@ -498,7 +551,7 @@ def show_in_game_menu(stdscr, allow_save=True):
 def arcade_name_entry(stdscr,total_time):
     stdscr.nodelay(False); name=""
     while True:
-        stdscr.erase(); h,w=stdscr.getmaxyx(); cy,cx=h//2,w//2
+        stdscr.erase(); h,w=stdscr.getmaxyx(); cy,cx = h//2, w//2
         stdscr.addstr(cy-5, cx-len("★ CONGRATULATIONS! ★")//2, "★ CONGRATULATIONS! ★", curses.A_BOLD)
         stdscr.addstr(cy-3, cx-len(f"FINAL TIME: {total_time:.2f}s")//2, f"FINAL TIME: {total_time:.2f}s")
         stdscr.addstr(cy-1, cx-len("ENTER INITIALS:")//2, "ENTER INITIALS:", curses.A_UNDERLINE)
@@ -509,12 +562,11 @@ def arcade_name_entry(stdscr,total_time):
         if k in (curses.KEY_BACKSPACE,127,8): name=name[:-1]
         elif 32<=k<=126 and len(name)<10: name += chr(k).upper()
 
-# --- main play loop (kept mostly intact) ---
+# --- main play loop (same behavior) ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
     p_timers=[]; plugin_data={}
-    if resume_state:
-        p_timers=resume_state.get("platform_timers",[]); plugin_data=resume_state.get("plugin_state",{})
+    if resume_state: p_timers=resume_state.get("platform_timers",[]); plugin_data=resume_state.get("plugin_state",{})
     grid, plats, title, meta = load_level(level_file, p_timers)
     if not grid: return "NO_FILE", 0.0
     px,py=1.5,1.5; start_cp=None
@@ -679,13 +731,14 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         draw_scene(stdscr, grid, plats, px, rpy, int(cx), int(cy), sum(fps_h)/len(fps_h), msg, t_offset+cur_t, level_num, title)
         time.sleep(0.005)
 
-# --- entry / arg parsing (compact) ---
+# --- entry / args (compact) ---
 def main(stdscr):
     global SAVE_SLOT_PATH, RESUME_FLAG, SPEEDRUN_MODE
     locale.setlocale(locale.LC_ALL, '')
-    curses.curs_set(0)
-    hold_timeout=0.6; inp=None; mode, path, tot_t, lvl = "CAMP","",0.0,1; resume_state=None
-    args=sys.argv[1:]; i=0
+    try: curses.curs_set(0)
+    except: pass
+    hold_timeout = 0.6; inp=None; mode, path, tot_t, lvl = "CAMP","",0.0,1; resume_state=None
+    args = sys.argv[1:]; i=0
     while i<len(args):
         a=args[i]
         if a=="--slot" and i+1<len(args): SAVE_SLOT_PATH=args[i+1]; i+=2
@@ -739,4 +792,3 @@ def main(stdscr):
 
 if __name__ == "__main__":
     curses.wrapper(main)
-
