@@ -116,6 +116,7 @@ class PygameBackend:
     Creates a tiny hidden pygame window (so SDL is happy) but polls X11's keyboard state
     via XQueryKeymap to detect keys regardless of window focus. If X11 is unavailable,
     it falls back to using pygame's event queue (requires focus).
+    force_focus() reasserts grab/pump/flip to coax SDL to accept keys again.
     """
     def __init__(self):
         self.active = False
@@ -127,14 +128,12 @@ class PygameBackend:
         self._display = None
         self._x11 = None
         self._keycodes = {}
-        # map keysyms to tokens (use X11 KeySym numeric values)
         self._syms = {
             'LEFT': 0xFF51, 'RIGHT': 0xFF53, 'UP': 0xFF52, 'DOWN': 0xFF54,
             'SPACE': 0x0020, 'Q': 0x0071, 'R': 0x0072, 'M': 0x006D,
             'CONTINUE': 0xFF0D, 'W': 0x0077, 'A': 0x0061, 'S': 0x0073, 'D': 0x0064, 'Z': 0x007A, 'H': 0x0068
         }
         try:
-            # create tiny window (offscreen if possible)
             import os as _os
             _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "-100,-100")
             import pygame as pg
@@ -157,11 +156,9 @@ class PygameBackend:
                 x11.XOpenDisplay.argtypes = [c_char_p]; x11.XOpenDisplay.restype = c_void_p
                 disp = x11.XOpenDisplay(None)
                 if disp:
-                    # set prototypes for functions we use
                     x11.XKeysymToKeycode.argtypes = [c_void_p, ctypes.c_ulong]; x11.XKeysymToKeycode.restype = ctypes.c_uint
                     x11.XQueryKeymap.argtypes = [c_void_p, c_char_p]
                     x11.XQueryKeymap.restype = None
-                    # compute keycodes for syms
                     keycodes = {}
                     for name, sym in self._syms.items():
                         try:
@@ -170,7 +167,6 @@ class PygameBackend:
                             code = 0
                         if code:
                             keycodes[name] = int(code)
-                    # if we have at least arrow keys and space, consider X11 present
                     if keycodes.get('LEFT') and keycodes.get('RIGHT'):
                         self._use_x11 = True
                         self._display = disp
@@ -179,7 +175,13 @@ class PygameBackend:
             except Exception:
                 self._use_x11 = False
 
-            # if X11 isn't available, we'll fall back to pygame event queue.
+            # store a window id attempt (may vary by platform)
+            try:
+                info = pg.display.get_wm_info()
+                self._wm_window = info.get('window') or info.get('xwindow') or info.get('windowid') or None
+            except Exception:
+                self._wm_window = None
+
             self.active = True
         except Exception:
             self.active = False
@@ -188,12 +190,11 @@ class PygameBackend:
         if not self.active:
             return []
         evs = []
-        # If we have X11, use XQueryKeymap and detect transitions
+        # XQueryKeymap path (state-based, focus-agnostic)
         if self._use_x11 and self._display and self._x11:
             try:
                 KeysArray = c_ubyte * 32
                 keys = KeysArray()
-                # cast to char* for XQueryKeymap
                 self._x11.XQueryKeymap(self._display, ctypes.cast(keys, c_char_p))
                 curr = set()
                 for name, code in self._keycodes.items():
@@ -205,24 +206,19 @@ class PygameBackend:
                                 curr.add(name)
                         except Exception:
                             pass
-                # produce events for transitions
                 for down in (curr - self._last):
                     evs.append((down, 1))
                 for up in (self._last - curr):
                     evs.append((up, 0))
                 self._last = curr
-                # also keep held set aligned for get_pressed_state
                 self._held = set(curr)
             except Exception:
-                # fallback to pygame event processing below
                 pass
 
-        # always still process pygame events (keeps SDL internal state sane)
+        # always consume pygame events to keep SDL internal state sane
         try:
             for e in self.pg.event.get():
                 if e.type == self.pg.KEYDOWN:
-                    raw = {v:k for k,v in self._syms.items()}.get(self._syms.get('W'))  # noop tweak to keep mapping place
-                    # map via key constant
                     mapped = {
                         self.pg.K_LEFT:"LEFT", self.pg.K_RIGHT:"RIGHT", self.pg.K_UP:"UP", self.pg.K_DOWN:"DOWN",
                         self.pg.K_SPACE:"SPACE", self.pg.K_RETURN:"CONTINUE", self.pg.K_KP_ENTER:"CONTINUE",
@@ -245,11 +241,10 @@ class PygameBackend:
                         except: pass
                         evs.append((mapped, 0))
         except Exception:
-            try:
-                self.pg.event.pump()
+            try: self.pg.event.pump()
             except: pass
 
-        # best-effort reassert grab & flip occasionally (keeps SDL active)
+        # periodic reassert grab & flip
         now = time.time()
         if now - self._last_focus > self._focus_interval:
             self._last_focus = now
@@ -265,23 +260,39 @@ class PygameBackend:
     def get_pressed_state(self):
         return set(self._held)
 
+    def force_focus(self, timeout=0.2, step=0.01):
+        """Try hard to reassert focus/grab for `timeout` seconds (default 200ms)."""
+        if not getattr(self, "active", False): return
+        pg = self.pg
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                pg.event.pump()
+            except:
+                pass
+            try:
+                pg.event.set_grab(True)
+            except:
+                pass
+            try:
+                pg.display.flip()
+            except:
+                pass
+            # small sleep so we don't busy loop and so X/SDL can react
+            time.sleep(step)
+
     def close(self):
-        # ungrab X keyboard if needed
         try:
             if getattr(self, "_use_x11", False) and getattr(self, "_x11", None) and getattr(self, "_display", None):
                 try:
-                    # try XCloseDisplay (we didn't call XUngrabKeyboard explicitly)
                     self._x11.XCloseDisplay.argtypes = [c_void_p]; self._x11.XCloseDisplay(self._display)
                 except:
                     pass
-                self._display = None
-                self._x11 = None
-                self._use_x11 = False
+                self._display = None; self._x11 = None; self._use_x11 = False
         except:
             pass
         if not getattr(self, "active", False): return
-        try:
-            self.pg.event.set_grab(False)
+        try: self.pg.event.set_grab(False)
         except: pass
         try: self.pg.quit()
         except: pass
@@ -327,6 +338,13 @@ class InputEngine:
         try: print(f"InputEngine: backend={self.backend_type}", file=sys.stderr)
         except: pass
 
+    def force_focus(self):
+        try:
+            if getattr(self, "backend", None) and hasattr(self.backend, "force_focus"):
+                self.backend.force_focus()
+        except Exception:
+            pass
+
     def _apply_event(self, raw, value):
         mapped = self.token_map.get(raw)
         if not mapped: return
@@ -353,9 +371,7 @@ class InputEngine:
         if self.backend_type and self.backend_type.startswith("pygame"):
             try:
                 held = self.backend.get_pressed_state()
-                # clear then set to reflect held keys
-                for k in list(self.ev_state.keys()):
-                    self.ev_state[k] = False
+                for k in list(self.ev_state.keys()): self.ev_state[k] = False
                 for raw in held:
                     m = self.token_map.get(raw)
                     if m:
@@ -368,7 +384,6 @@ class InputEngine:
         now = time.time()
         to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
         for k in to_rel:
-            # find any raw token mapping to k
             raw_equiv = None
             for raw, mapped in self.token_map.items():
                 if mapped == k:
@@ -426,8 +441,6 @@ class Platform:
             norm = (self.t / math.pi) % 2; off = norm - 1 if norm > 1 else 1 - norm
         self.x = self.ox + (off * (self.lx / 2)); self.y = self.oy + (off * (self.ly / 2))
     def rect(self): return (self.x, self.y, self.x + self.w, self.y + 1)
-
-def load_plugins(): pass  # already loaded above (kept for compatibility)
 
 def load_level(path, platform_timers=None):
     if not os.path.exists(path): return None, [], "UNKNOWN", {}
@@ -586,31 +599,52 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
         except: pass
     cx,cy=0,0; fps_h=deque(maxlen=30); start=time.time(); last=time.time(); cur_t=0.0; msg=None; mend=0
     ap=None; ap_off=0.0; stdscr.nodelay(True)
+
+    # ensure focus while we play
+    try:
+        if hasattr(inp, "force_focus"): inp.force_focus()
+    except: pass
+
     def make_game_state(): return {"grid":grid,"platforms":plats,"level":title,"meta":meta}
     while True:
         inp.update(stdscr)
         if inp.was('MENU') or inp.was('QUIT'):
             draw_scene(stdscr, grid, plats, px, py, cx, cy, 0, "PAUSED (M:MENU)", t_offset+cur_t, level_num, title)
             choice = show_in_game_menu(stdscr, allow_save=allow_save)
-            if choice in ("RESUME","CANCEL"): inp.clear(); last=time.time()
-            elif choice=="SAVE_ONLY":
+
+            if choice in ("RESUME","CANCEL"):
+                inp.clear(); last=time.time()
+                # reassert focus right after leaving menu
+                try:
+                    if hasattr(inp, "force_focus"): inp.force_focus()
+                except: pass
+
+            elif choice == "SAVE_ONLY":
                 if SAVE_SLOT_PATH:
                     save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
                           "tot_time":t_offset+cur_t,"platform_timers":[p.t for p in plats],"plugin_state":plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save); msg="SAVED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
                 inp.clear(); last=time.time()
-            elif choice=="CLEAR_SLOT":
+                try:
+                    if hasattr(inp, "force_focus"): inp.force_focus()
+                except: pass
+
+            elif choice == "CLEAR_SLOT":
                 if SAVE_SLOT_PATH: clear_slot(SAVE_SLOT_PATH); msg="SLOT CLEARED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
                 inp.clear(); last=time.time()
-            elif choice=="SAVE_QUIT":
+                try:
+                    if hasattr(inp, "force_focus"): inp.force_focus()
+                except: pass
+
+            elif choice == "SAVE_QUIT":
                 if SAVE_SLOT_PATH:
                     save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
                           "tot_time":t_offset+cur_t,"platform_timers":[p.t for p in plats],"plugin_state":plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save)
                 return "QUIT", 0.0
-            elif choice=="QUIT_NO_SAVE": return "QUIT", 0.0
+            elif choice == "QUIT_NO_SAVE": return "QUIT", 0.0
 
         now=time.time(); dt=min(now-last,0.1); last=now; dt=DT if dt<0 else dt; cur_t=now-start
         for p in plats: p.update(dt)
