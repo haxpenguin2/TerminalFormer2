@@ -5,7 +5,7 @@ import ctypes, locale
 from collections import deque
 from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
-# --- CONFIG ---
+#TS IS CRAZY
 GRAVITY, JUMP_V, MOVE_SPEED = 90.0, -28.0, 24.0
 FPS, MAX_SUBSTEP, DT = 60.0, 0.02, 1.0 / 60.0
 DIRS = {'LEVELS': "levels", 'CAMP': "campaignlevels", 'SCORES': "scores.json", 'PLUGINS': "plugins"}
@@ -14,7 +14,7 @@ PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
 for d in [DIRS['LEVELS'], DIRS['CAMP'], DIRS['PLUGINS']]:
     os.makedirs(d, exist_ok=True)
 
-# --- plugin loader (compact) ---
+# PLuGins
 REGISTRY = {}; PLUGINS = []
 def load_plugins():
     for p in glob.glob(os.path.join(DIRS['PLUGINS'], "*.py")):
@@ -35,7 +35,7 @@ def load_plugins():
 load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
-# --- scores / save helpers ---
+# --- scores / save helpers ---  
 SAVE_SLOT_PATH = None; RESUME_FLAG = False; SPEEDRUN_MODE = False
 def save_score(cat, val, name="Player"):
     data = {}
@@ -69,7 +69,7 @@ def clear_slot(path):
         if path and os.path.exists(path): os.remove(path)
     except: pass
 
-# --- EVDEV BACKEND (native) ---
+# --- EVDEV BACKEND!!!! (my favorite, we love evdev)
 class EvdevBackend:
     def __init__(self):
         try:
@@ -121,7 +121,7 @@ class EvdevBackend:
         return set(self._held)
 
     def set_grab(self, state):
-        # evdev doesn't need to grab/ungrab window focus; leave empty
+        # evdev doesn't need to grab/ungrab window focus; leave empty you slut
         pass
 
     def close(self):
@@ -129,7 +129,7 @@ class EvdevBackend:
             try: d.close()
             except: pass
 
-# --- PYGAME+X11 BACKEND ---
+# --- PYGAME+X11 BACKEND BECAUE CROSTINI IS ASS
 class PygameBackend:
     def __init__(self):
         self.active = False
@@ -300,7 +300,7 @@ class PygameBackend:
         except: pass
         self.active = False
 
-# --- INPUT ENGINE ---
+# --- INPUT ENGINE (ima kms this si too much code)
 class InputEngine:
     def __init__(self, hold_timeout=0.6):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
@@ -396,7 +396,7 @@ class InputEngine:
                     raw_equiv = raw; break
             if raw_equiv: self._apply_event(raw_equiv, 0)
 
-        # curses fallback (non-blocking)
+        # curses fallback. i dont know why i even have this ngl
         curses_keys = {k: False for k in self.keys}
         try:
             while True:
@@ -433,7 +433,7 @@ class InputEngine:
                 except: pass
         except: pass
 
-# --- game objects & helpers (condensed) ---
+# --- game objects & helpers (the only optimized script in this entire shit) ---
 class Platform:
     def __init__(self, d, start_t=0.0):
         self.ox, self.oy, self.w = d['x'], d['y'], d['w']
@@ -547,7 +547,7 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-# --- MENU FUNCTIONS (RESTORED to original signatures so positions/layout unchanged) ---
+# --- MENU FUNCTIONS (DO NTO MESS WITH THESE IT WILL KILL YOU) ---
 def show_in_game_menu(stdscr, allow_save=True):
     stdscr.nodelay(False)
     opts=["Resume"]
