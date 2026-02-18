@@ -5,12 +5,15 @@ import ctypes, locale
 from collections import deque
 from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
-#TS IS CRAZY
+# TS IS CRAZY
 GRAVITY, JUMP_V, MOVE_SPEED = 90.0, -28.0, 24.0
 FPS, MAX_SUBSTEP, DT = 60.0, 0.02, 1.0 / 60.0
 DIRS = {'LEVELS': "levels", 'CAMP': "campaignlevels", 'SCORES': "scores.json", 'PLUGINS': "plugins"}
 TILES = {'SOLID': '█', 'SPIKE': '▲', 'SPIKE_DN': '▼', 'CP': 'C', 'SPAWN': 'S', 'GOAL': 'G', 'PLAYER': '#'}
 PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
+# collision epsilon for half-open fudging
+EPS_COLLIDE = 1e-6
+
 for d in [DIRS['LEVELS'], DIRS['CAMP'], DIRS['PLUGINS']]:
     os.makedirs(d, exist_ok=True)
 
@@ -31,11 +34,12 @@ def load_plugins():
                     if isinstance(ch, str) and len(ch) == 1:
                         REGISTRY[ch] = mm
         except Exception:
+            # keep plugin loading robust; individual plugin errors are ignored
             pass
 load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
-# --- scores / save helpers ---  
+# --- scores / save helpers ---
 SAVE_SLOT_PATH = None; RESUME_FLAG = False; SPEEDRUN_MODE = False
 def save_score(cat, val, name="Player"):
     data = {}
@@ -346,7 +350,7 @@ class InputEngine:
                 else:
                     # reassert grab when resuming game
                     self.backend.set_grab(True)
-                    if hasattr(self.backend, 'force_focus'): 
+                    if hasattr(self.backend, 'force_focus'):
                         try: self.backend.force_focus()
                         except: pass
             except: pass
@@ -470,6 +474,7 @@ def load_level(path, platform_timers=None):
 
 def get_plugin(ch): return REGISTRY.get(ch)
 def is_solid(grid,x,y):
+    # keep original behavior: out-of-bounds => solid (so player can't leave level)
     if 0<=y<len(grid) and 0<=x<len(grid[0]):
         ch = grid[int(y)][int(x)]
         if ch in ('C','S','G',' '): return False
@@ -480,11 +485,45 @@ def is_solid(grid,x,y):
         return ch == TILES['SOLID']
     return True
 
-def check_rect(grid,l,t,r,b):
-    for yy in range(int(math.floor(t)), int(math.floor(b))+1):
-        for xx in range(int(math.floor(l)), int(math.floor(r))+1):
-            if is_solid(grid, xx, yy): return True
+def check_rect(grid, l, t, r, b):
+    """
+    Fixed, half-open rectangle tile test.
+
+    Returns True if any tile inside [l, r) x [t, b) is solid.
+    This avoids the previous inclusive-upper-bound fencepost bug that caused
+    false collisions when an edge was exactly integer-aligned.
+    """
+    if not grid:
+        return False
+    h = len(grid); w = len(grid[0])
+    # Use floor for inclusive lower bound, ceil for exclusive upper bound.
+    min_y = int(math.floor(t)); max_y = int(math.ceil(b))
+    min_x = int(math.floor(l)); max_x = int(math.ceil(r))
+
+    # Clip to grid bounds early for speed & safety:
+    if min_x < 0: min_x = 0
+    if min_y < 0: min_y = 0
+    if max_x > w: max_x = w
+    if max_y > h: max_y = h
+
+    # short-circuit empty ranges
+    if min_x >= max_x or min_y >= max_y:
+        return False
+
+    # iterate rows & columns
+    for yy in range(min_y, max_y):
+        row = grid[yy]
+        for xx in range(min_x, max_x):
+            if is_solid(grid, xx, yy):
+                return True
     return False
+
+def rect_collides(grid, l, t, r, b, eps=EPS_COLLIDE):
+    """
+    Collision wrapper that slightly insets the tested rectangle to avoid edge-case
+    float fences where an edge exactly aligns with a tile boundary.
+    """
+    return check_rect(grid, l + eps, t + eps, r - eps, b - eps)
 
 def check_plat(plats,l,t,r,b):
     for p in plats:
@@ -504,18 +543,23 @@ def resolve_char(grid,plats,cx,cy,title,default):
 
 def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, ltitle, vis=True):
     h,w = stdscr.getmaxyx(); stdscr.erase()
-    gh,gw = len(grid), len(grid[0]) if grid else 0
+    gh = len(grid); gw = len(grid[0]) if gh>0 else 0
     ox = (w-gw)//2 if gw < w else 0; oy = (h-gh)//2 if gh < h else 0
     sx = int(max(0,min(cx,max(0,gw-w)))) if gw >= w else 0
     sy = int(max(0,min(cy,max(0,gh-h)))) if gh >= h else 0
+
+    # Draw visible rows only
     for scr_y in range(h):
         my = scr_y - oy + sy
         if 0 <= my < gh:
             row = grid[my]; sl = min(sx+w, len(row))
             if sx < sl:
+                # resolve_char can be a bit heavy; keep inline list comprehension but avoid excessive calls
                 ln = "".join([str(resolve_char(grid,plats,x,my,ltitle,row[x])) for x in range(sx,sl)])
                 try: stdscr.addstr(scr_y, max(0, ox), ln)
                 except: pass
+
+    # Draw platforms (visual)
     for p in plats:
         spx, spy = int(p.x - sx) + ox, int(p.y - sy) + oy
         if 0 <= spy < h:
@@ -523,6 +567,7 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
             if dl > 0:
                 try: stdscr.addstr(spy, max(0, spx), TILES['SOLID'] * int(dl), curses.A_BOLD)
                 except: pass
+
     spx, spy = int(px - sx) + ox, int(py - sy) + oy
     if vis and 0 <= spx < w and 0 <= spy < h:
         try: stdscr.addch(spy, spx, TILES['PLAYER'], curses.A_BOLD)
@@ -652,7 +697,9 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
             elif choice == "QUIT_NO_SAVE": return "QUIT", 0.0
 
         now=time.time(); dt=min(now-last,0.1); last=now; dt=DT if dt<0 else dt; cur_t=now-start
+        # update platforms (hot path: localize)
         for p in plats: p.update(dt)
+
         if inp.was('RESET'):
             px,py,vx,vy,ap = cp[0],cp[1]-0.1,0,0,None
             for m in PLUGINS:
@@ -660,9 +707,11 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     try: f(make_game_state(), plugin_data)
                     except: pass
 
-        ground = check_rect(grid, px-PHYS['HW'], py+PHYS['HH'], px+PHYS['HW'], py+PHYS['HH']+0.05)
+        # simplified ground check & input direction (use inset collision wrapper)
+        ground = rect_collides(grid, px-PHYS['HW'], py+PHYS['HH'], px+PHYS['HW'], py+PHYS['HH']+0.05)
         idir = (inp.down('RIGHT') - inp.down('LEFT'))
 
+        # --- PLATFORM ATTACH MODE (ap) ---
         if ap:
             if inp.was('JUMP'):
                 vy = JUMP_V; px = ap.x + ap_off; ap = None
@@ -672,12 +721,13 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     step=min(rem,MAX_SUBSTEP); rem-=step
                     nxt = cur + (idir*MOVE_SPEED)*step
                     wx,wy = ap.x + nxt, ap.y - PHYS['HH'] - PHYS['TOL']
-                    if check_rect(grid, wx-PHYS['HW'], wy-PHYS['HH']+0.1, wx+PHYS['HW'], wy+PHYS['HH']-0.1): break
+                    if rect_collides(grid, wx-PHYS['HW'], wy-PHYS['HH']+0.1, wx+PHYS['HW'], wy+PHYS['HH']-0.1): break
                     cur = nxt
                 ap_off = cur; px = ap.x + cur; py = ap.y - PHYS['HH'] - PHYS['TOL']; vy = 0
                 if ap_off + PHYS['HW'] <= 0 or ap_off - PHYS['HW'] >= ap.w: ap=None
                 sy = int(py + PHYS['HH'] + 0.05)
-                for lx in {int(px), int(px-PHYS['HW']+0.1), int(px+PHYS['HW']-0.1)}:
+                # plugin-supported checks when standing on platform
+                for lx in (int(px), int(px-PHYS['HW']+0.1), int(px+PHYS['HW']-0.1)):
                     if 0<=sy<len(grid) and 0<=lx<len(grid[0]):
                         pmeta = get_plugin(grid[sy][lx])
                         if pmeta and callable(f:=pmeta.get('runtime',{}).get('on_player_supported')):
@@ -686,44 +736,70 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                                 f({"dt":dt,"grid":grid,"level":title,"meta":meta}, pstate, lx, sy, plugin_data)
                                 vx=float(pstate.get("vx",vx)); vy=float(pstate.get("vy",vy))
                             except: pass
+
+        # --- NORMAL PHYSICS MODE ---
         else:
+            # jump / gravity
             if inp.was('JUMP') and ground: vy = JUMP_V
             else: vy += GRAVITY * dt
             vx = idir * MOVE_SPEED
+
+            # use time-sliced substeps (already present) but use inset collision checks
             rem = dt
             while rem>0:
-                step=min(rem,MAX_SUBSTEP); rem-=step
-                npx = px + vx*step
-                if check_rect(grid, npx-PHYS['HW'], py-PHYS['HH']+0.01, npx+PHYS['HW'], py+PHYS['HH']-0.01): vx=0
-                elif check_plat(plats, npx-PHYS['HW'], py-PHYS['HH']+0.1, npx+PHYS['HW'], py+PHYS['HH']-0.1): vx=0
-                else: px=npx
-            rem = dt
-            while rem>0:
-                step=min(rem,MAX_SUBSTEP); rem-=step
-                npy = py + vy*step
-                if check_rect(grid, px-PHYS['HW'], npy-PHYS['HH'], px+PHYS['HW'], npy+PHYS['HH']):
-                    if vy>0:
-                        ly=int(math.floor(npy+PHYS['HH'])); py,vy = ly-PHYS['HH']-0.001,0
-                        for lx in {int(px), int(px-PHYS['HW']+0.01), int(px+PHYS['HW']-0.01)}:
-                            if 0<=ly<len(grid) and 0<=lx<len(grid[0]):
-                                pmeta=get_plugin(grid[ly][lx])
+                step = min(rem, MAX_SUBSTEP); rem -= step
+
+                # horizontal attempt (axis-separated)
+                if vx != 0.0:
+                    npx = px + vx * step
+                    if rect_collides(grid, npx - PHYS['HW'], py - PHYS['HH'] + 0.01, npx + PHYS['HW'], py + PHYS['HH'] - 0.01):
+                        # blocked horizontally — zero horizontal velocity for this axis
+                        vx = 0.0
+                    elif check_plat(plats, npx-PHYS['HW'], py-PHYS['HH']+0.1, npx+PHYS['HW'], py+PHYS['HH']-0.1):
+                        vx = 0.0
+                    else:
+                        px = npx
+
+                # vertical attempt
+                npy = py + vy * step
+                if rect_collides(grid, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH']):
+                    # vertical collision handling
+                    if vy > 0:
+                        # hit a ceiling from below while moving downward (vy>0 means falling in this coordinate system)
+                        ly = int(math.floor(npy + PHYS['HH']))
+                        py = ly - PHYS['HH'] - 0.001
+                        vy = 0.0
+                        # platform support hooks near feet (use inset to avoid boundary issues)
+                        for lx in (int(px), int(px-PHYS['HW']+0.01), int(px+PHYS['HW']-0.01)):
+                            if 0 <= ly < len(grid) and 0 <= lx < len(grid[0]):
+                                pmeta = get_plugin(grid[ly][lx])
                                 if pmeta and callable(f:=pmeta.get('runtime',{}).get('on_player_supported')):
                                     try:
                                         pstate={"px":px,"py":py,"vx":vx,"vy":vy}
                                         f({"dt":step,"grid":grid,"level":title,"meta":meta}, pstate, lx, ly, plugin_data)
                                         vx=float(pstate.get("vx",vx)); vy=float(pstate.get("vy",vy))
                                     except: pass
-                    elif vy<0: py,vy = math.floor(npy-PHYS['HH'])+PHYS['HH']+1.001, 0
+                    elif vy < 0:
+                        # hitting something above while moving upward (vy<0)
+                        py = math.floor(npy - PHYS['HH']) + PHYS['HH'] + 1.001
+                        vy = 0.0
                 else:
-                    hit = check_plat(plats, px-PHYS['HW'], npy-PHYS['HH'], px+PHYS['HW'], npy+PHYS['HH'])
+                    # check for platform collisions (moving through platforms)
+                    hit = check_plat(plats, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH'])
                     if hit:
-                        if vy>0:
-                            ap=hit; ap_off = px - hit.x; py = hit.y - PHYS['HH'] - PHYS['TOL']; vy=0
-                        elif vy<0: py,vy = hit.y + 1.0 + PHYS['HH'] + PHYS['TOL'], 0
-                    else: py = npy
+                        if vy > 0:
+                            ap = hit; ap_off = px - hit.x
+                            py = hit.y - PHYS['HH'] - PHYS['TOL']; vy = 0.0
+                        elif vy < 0:
+                            py = hit.y + 1.0 + PHYS['HH'] + PHYS['TOL']; vy = 0.0
+                    else:
+                        py = npy
 
+        # --- POST-PHYSICS: collision triggers, plugins, death, cp, etc. ---
         icx,icy = int(px), int(py)
-        crush = is_solid(grid, px, py)
+        # more robust crush detection using rect_collides
+        crush = rect_collides(grid, px - PHYS['HW'] + EPS_COLLIDE, py - PHYS['HH'] + EPS_COLLIDE,
+                              px + PHYS['HW'] - EPS_COLLIDE, py + PHYS['HH'] - EPS_COLLIDE)
         dist_to_cp = math.hypot(px-cp[0], py-cp[1]); is_safe=(dist_to_cp<1.0)
         tile = grid[icy][icx] if (0<=icy<len(grid) and 0<=icx<len(grid[0])) else ' '
         if tile==TILES['GOAL']: return "NEXT_LEVEL", cur_t
@@ -830,3 +906,4 @@ def main(stdscr):
 
 if __name__ == "__main__":
     curses.wrapper(main)
+
