@@ -46,10 +46,6 @@ draw_bar() {
     local num_filled=$(( (percent * width) / 100 ))
     local num_empty=$(( width - num_filled ))
     
-    # Build the bar using Unicode block characters
-    # █ = U+2588 (Full Block)
-    # ░ = U+2591 (Light Shade)
-    
     local bar_filled=""
     if [ "$num_filled" -gt 0 ]; then
         bar_filled=$(printf '█%.0s' $(seq 1 $num_filled))
@@ -60,14 +56,15 @@ draw_bar() {
         bar_empty=$(printf '░%.0s' $(seq 1 $num_empty))
     fi
     
-    # Construct the line
-    # Format: [████░░░░] 50% Step Name
     echo -ne "\r${BOLD}${CYAN}[${CYAN}${bar_filled}${NC}${BOLD}${bar_empty}${CYAN}]${NC} ${percent}% ${PURPLE}::${NC} ${text}\033[K"
 }
 
 # --- MAIN SCRIPT ---
 
 print_banner
+
+# defaults
+PERMISSIONS_CHANGED=false
 
 # 0. PRE-FLIGHT CHECK
 echo -e "${YELLOW}:: Requesting administrative access for installation...${NC}"
@@ -81,16 +78,30 @@ tput civis
 
 # 1. CHECK DEPENDENCIES
 draw_bar 10 "Checking System Libraries..."
+
 if [ -x "$(command -v apt-get)" ]; then
-    # Silence output so the bar stays clean
     sudo apt-get update > /dev/null 2>&1
-    # Added python3-pygame so pygame is available via apt on Debian/Ubuntu systems.
-    sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm python3-pygame > /dev/null 2>&1
+    sudo apt-get install -y python3-evdev git python3 python3-pip curl xterm python3-pygame desktop-file-utils > /dev/null 2>&1
+elif [ -x "$(command -v pacman)" ]; then
+    # Arch/Manjaro path: update DB and install common dependencies
+    sudo pacman -Syu --noconfirm --needed git python python-pip python-pygame python-evdev curl xterm desktop-file-utils > /dev/null 2>&1
+elif [ -x "$(command -v yay)" ]; then
+    # If user has an AUR helper but not pacman (unlikely), attempt to use yay
+    yay -S --noconfirm --needed git python python-pip python-pygame python-evdev curl xterm desktop-file-utils > /dev/null 2>&1
+else
+    # Unknown package manager — we'll try to continue and fallback to pip for python deps
+    :
+fi
+
+# Try to ensure required python modules exist; fallback to pip --user if needed
+if ! python3 -c "import pygame, evdev" >/dev/null 2>&1; then
+    draw_bar 20 "Installing Python modules via pip..."
+    # install into user site-packages to avoid needing system python access
+    python3 -m pip install --user pygame evdev > /dev/null 2>&1 || true
 fi
 
 # 2. FIX INPUT PERMISSIONS
 draw_bar 30 "Verifying Input Permissions..."
-# Sleep purely for visual effect so the user sees this step happened
 sleep 0.5 
 if ! groups "$USER" | grep &>/dev/null "\binput\b"; then
     if sudo usermod -a -G input "$USER" > /dev/null 2>&1; then
@@ -116,7 +127,7 @@ if [ ! -d "$INSTALL_DIR" ]; then
     tput cnorm # Restore cursor if we crash
     echo ""
     echo -e "${RED}ERROR: Git clone failed. Check internet connection.${NC}"
-    kill $SUDO_PID
+    if [ -n "$SUDO_PID" ]; then kill $SUDO_PID; fi
     exit 1
 fi
 
@@ -167,7 +178,10 @@ Categories=Game;
 Keywords=platformer;terminal;game;
 EOF
 
-update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
+# update desktop db if available
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$HOME/.local/share/applications" > /dev/null 2>&1
+fi
 
 # 7. FINALIZE
 draw_bar 100 "Finalizing..."
@@ -175,7 +189,7 @@ sudo chown -R "$USER:$USER" "$INSTALL_DIR" > /dev/null 2>&1
 sleep 0.5
 
 # Kill background sudo and restore cursor
-kill $SUDO_PID
+if [ -n "$SUDO_PID" ]; then kill $SUDO_PID; fi
 tput cnorm
 
 echo ""
