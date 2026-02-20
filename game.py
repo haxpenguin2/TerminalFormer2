@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # TerminalFormer2 - single-file input (evdev else pygame+XQueryKeymap) + game logic
-import curses, time, os, math, sys, json, glob, importlib.util, select
+# *patched for more robust input, normalized level keys for plugin state, better save metadata*
+
+import curses, time, os, math, sys, json, glob, importlib.util, select, traceback
 import ctypes, locale
-from collections import deque
+from collections import deque, defaultdict
 from ctypes import c_void_p, c_char_p, c_ubyte, create_string_buffer
 
 # TS IS CRAZY
@@ -13,6 +15,14 @@ TILES = {'SOLID': '█', 'SPIKE': '▲', 'SPIKE_DN': '▼', 'CP': 'C', 'SPAWN': 
 PHYS = {'HW': 0.4, 'HH': 0.5, 'TOL': 0.001}
 # collision epsilon for half-open fudging
 EPS_COLLIDE = 1e-6
+
+def debug_log(msg):
+    """Write debug messages when TF2_DEBUG=1 in environment"""
+    if os.environ.get("TF2_DEBUG"):
+        try:
+            with open(os.path.expanduser("~/.tf2_debug.log"), "a") as f:
+                f.write(f"{time.time():.3f} {msg}\n")
+        except: pass
 
 for d in [DIRS['LEVELS'], DIRS['CAMP'], DIRS['PLUGINS']]:
     os.makedirs(d, exist_ok=True)
@@ -34,8 +44,8 @@ def load_plugins():
                     if isinstance(ch, str) and len(ch) == 1:
                         REGISTRY[ch] = mm
         except Exception:
+            debug_log("plugin load failed: " + (p or "<unknown>") + "\n" + traceback.format_exc())
             # keep plugin loading robust; individual plugin errors are ignored
-            pass
 load_plugins()
 def get_plugin(ch): return REGISTRY.get(ch)
 
@@ -59,13 +69,15 @@ def save_game_state_to(path, state):
         tmp = path + ".tmp"
         with open(tmp, "w") as f: json.dump(state, f)
         os.replace(tmp, path)
-    except: pass
+    except Exception:
+        debug_log("save_game_state error:\n" + traceback.format_exc())
 
 def load_saved_game_from(path):
     try:
         if path and os.path.exists(path):
             return json.load(open(path))
-    except: pass
+    except Exception:
+        debug_log("load_saved_game error:\n" + traceback.format_exc())
     return None
 
 def clear_slot(path):
@@ -73,7 +85,7 @@ def clear_slot(path):
         if path and os.path.exists(path): os.remove(path)
     except: pass
 
-# --- EVDEV BACKEND!!!! (my favorite, we love evdev)
+# --- EVDEV BACKEND (keeps same behaviour) ---
 class EvdevBackend:
     def __init__(self):
         try:
@@ -118,14 +130,14 @@ class EvdevBackend:
                                 evs.append((tok,0))
                             # ignore repeat (we use held-set)
         except Exception:
-            pass
+            debug_log("evdev poll error:\n" + traceback.format_exc())
         return evs
 
     def get_pressed_state(self):
         return set(self._held)
 
     def set_grab(self, state):
-        # evdev doesn't need to grab/ungrab window focus; leave empty you slut
+        # evdev doesn't need to grab/ungrab window focus; leave empty
         pass
 
     def close(self):
@@ -133,7 +145,7 @@ class EvdevBackend:
             try: d.close()
             except: pass
 
-# --- PYGAME+X11 BACKEND BECAUE CROSTINI IS ASS
+# --- PYGAME+X11 BACKEND ---
 class PygameBackend:
     def __init__(self):
         self.active = False
@@ -182,7 +194,8 @@ class PygameBackend:
                         self._use_x11 = True; self._display = disp; self._x11 = x11; self._keycodes = keycodes
             except Exception: self._use_x11 = False
             self.active = True
-        except Exception: self.active = False
+        except Exception:
+            self.active = False
 
     def _recreate_display(self):
         try:
@@ -228,7 +241,8 @@ class PygameBackend:
                 for down in (curr - self._last): evs.append((down, 1))
                 for up in (self._last - curr): evs.append((up, 0))
                 self._last = curr; self._held = set(curr)
-            except Exception: pass
+            except Exception:
+                debug_log("X11 poll failed:\n" + traceback.format_exc())
 
         # Always consume pygame events so SDL stays happy
         try:
@@ -304,7 +318,7 @@ class PygameBackend:
         except: pass
         self.active = False
 
-# --- INPUT ENGINE (ima kms this si too much code)
+# --- INPUT ENGINE (more robust multi-raw-key handling) ---
 class InputEngine:
     def __init__(self, hold_timeout=0.6):
         self.keys = {k: False for k in ['LEFT','RIGHT','UP','DOWN','JUMP','RESET','QUIT','CONTINUE','MENU']}
@@ -312,6 +326,9 @@ class InputEngine:
         self._last_seen = {}; self._hold_timeout = float(hold_timeout)
         self.backend = None; self.backend_type = None
         self._menu_mode = False
+
+        # NEW: map logical mapped key -> set(of raw tokens currently down)
+        self._raw_held_map = defaultdict(set)
 
         try:
             has_events = False
@@ -375,30 +392,37 @@ class InputEngine:
         evs = []
         try:
             if self.backend: evs = self.backend.poll(0.0)
-        except Exception: evs = []
+        except Exception:
+            evs = []
+            debug_log("backend.poll failed:\n" + traceback.format_exc())
         for raw, v in evs: self._apply_event(raw, v)
 
         # sync backend held-set -> ev_state (ensures continuous down())
         try:
             if self.backend and hasattr(self.backend, "get_pressed_state"):
                 held = self.backend.get_pressed_state()
+                # clear then repopulate from held set
                 for k in list(self.ev_state.keys()): self.ev_state[k] = False
                 for raw in held:
                     m = self.token_map.get(raw)
                     if m:
                         self.ev_state[m] = True
                         self._last_seen[m] = time.time()
-        except Exception: pass
+                        # ensure raw-held mapping records raw holder
+                        self._raw_held_map[m].add(raw)
+        except Exception:
+            debug_log("pressed_state sync failed:\n" + traceback.format_exc())
 
         # release by timeout (safety)
         now = time.time()
         to_rel = [k for k, ts in list(self._last_seen.items()) if now - ts > self._hold_timeout]
         for k in to_rel:
-            raw_equiv = None
-            for raw, mapped in self.token_map.items():
-                if mapped == k:
-                    raw_equiv = raw; break
-            if raw_equiv: self._apply_event(raw_equiv, 0)
+            # clear internal raw map and ev_state
+            try:
+                self._raw_held_map.pop(k, None)
+                self.ev_state[k] = False
+                self._last_seen.pop(k, None)
+            except: pass
 
         # curses fallback. i dont know why i even have this ngl
         curses_keys = {k: False for k in self.keys}
@@ -419,17 +443,28 @@ class InputEngine:
         if not mapped: return
         prev = bool(self.ev_state.get(mapped, False))
         if value == 1:
+            # add raw token to the set for this mapped action
+            self._raw_held_map[mapped].add(raw)
             if not prev: self.pressed.add(mapped)
             self.ev_state[mapped] = True; self._last_seen[mapped] = time.time()
         else:
-            self.ev_state[mapped] = False; self._last_seen.pop(mapped, None)
+            # remove raw token; if no raw tokens left, release mapped action
+            s = self._raw_held_map.get(mapped)
+            if s:
+                try: s.discard(raw)
+                except: pass
+            if not s or len(s) == 0:
+                self.ev_state[mapped] = False; self._last_seen.pop(mapped, None)
+            else:
+                # still held by other raw key(s) -> keep pressed and update last_seen
+                self._last_seen[mapped] = time.time()
 
     def was(self, k): return k in self.pressed
     def down(self, k): return bool(self.keys.get(k, False))
     def clear(self): self.pressed.clear()
     def reset(self):
         for kk in self.keys: self.keys[kk] = False; self.ev_state[kk] = False
-        self.pressed.clear(); self._last_seen.clear()
+        self.pressed.clear(); self._last_seen.clear(); self._raw_held_map.clear()
     def stop(self):
         try:
             if getattr(self, "backend", None):
@@ -437,7 +472,7 @@ class InputEngine:
                 except: pass
         except: pass
 
-# --- game objects & helpers (the only optimized script in this entire shit) ---
+# --- game objects & helpers ---
 class Platform:
     def __init__(self, d, start_t=0.0):
         self.ox, self.oy, self.w = d['x'], d['y'], d['w']
@@ -473,7 +508,7 @@ def load_level(path, platform_timers=None):
     return grid, plats, title, meta
 
 def get_plugin(ch): return REGISTRY.get(ch)
-def is_solid(grid,x,y):
+def is_solid(grid,x,y, level_name=None):
     # keep original behavior: out-of-bounds => solid (so player can't leave level)
     if 0<=y<len(grid) and 0<=x<len(grid[0]):
         ch = grid[int(y)][int(x)]
@@ -481,49 +516,59 @@ def is_solid(grid,x,y):
         p = get_plugin(ch)
         if p and 'runtime' in p:
             s = p['runtime'].get('solid')
-            if callable(s): return bool(s(grid,x,y)); return bool(s)
+            if callable(s):
+                # try to call the plugin solid function in a few compatible ways:
+                try:
+                    # preferred: solid(grid, x, y, level_name)
+                    return bool(s(grid, x, y, level_name))
+                except TypeError:
+                    try:
+                        # fallback: solid(grid, x, y)
+                        return bool(s(grid, x, y))
+                    except Exception:
+                        # fallback: solid(game_state, x, y)
+                        try:
+                            gs = {"grid": grid, "level": level_name}
+                            return bool(s(gs, x, y))
+                        except Exception:
+                            debug_log(f"plugin solid call failed for {ch} at {x},{y}:\n" + traceback.format_exc())
+                            return bool(False)
+                except Exception:
+                    debug_log(f"plugin solid call exception for {ch} at {x},{y}:\n" + traceback.format_exc())
+                    return bool(False)
+            return bool(s)
         return ch == TILES['SOLID']
     return True
 
-def check_rect(grid, l, t, r, b):
+def check_rect(grid, l, t, r, b, level_name=None):
     """
     Fixed, half-open rectangle tile test.
 
     Returns True if any tile inside [l, r) x [t, b) is solid.
-    This avoids the previous inclusive-upper-bound fencepost bug that caused
-    false collisions when an edge was exactly integer-aligned.
     """
     if not grid:
         return False
     h = len(grid); w = len(grid[0])
-    # Use floor for inclusive lower bound, ceil for exclusive upper bound.
     min_y = int(math.floor(t)); max_y = int(math.ceil(b))
     min_x = int(math.floor(l)); max_x = int(math.ceil(r))
 
-    # Clip to grid bounds early for speed & safety:
     if min_x < 0: min_x = 0
     if min_y < 0: min_y = 0
     if max_x > w: max_x = w
     if max_y > h: max_y = h
 
-    # short-circuit empty ranges
     if min_x >= max_x or min_y >= max_y:
         return False
 
-    # iterate rows & columns
     for yy in range(min_y, max_y):
         row = grid[yy]
         for xx in range(min_x, max_x):
-            if is_solid(grid, xx, yy):
+            if is_solid(grid, xx, yy, level_name):
                 return True
     return False
 
-def rect_collides(grid, l, t, r, b, eps=EPS_COLLIDE):
-    """
-    Collision wrapper that slightly insets the tested rectangle to avoid edge-case
-    float fences where an edge exactly aligns with a tile boundary.
-    """
-    return check_rect(grid, l + eps, t + eps, r - eps, b - eps)
+def rect_collides(grid, l, t, r, b, eps=EPS_COLLIDE, level_name=None):
+    return check_rect(grid, l + eps, t + eps, r - eps, b - eps, level_name)
 
 def check_plat(plats,l,t,r,b):
     for p in plats:
@@ -531,13 +576,14 @@ def check_plat(plats,l,t,r,b):
         if l<pr and r>pl and t<pb and b>pt: return p
     return None
 
-def resolve_char(grid,plats,cx,cy,title,default):
+def resolve_char(grid,plats,cx,cy, fps_title, default):
     p = get_plugin(default)
     if p:
         rt,ed = p.get('runtime',{}), p.get('editor',{})
         if callable(rt.get('get_display_char')):
-            try: return rt['get_display_char'](grid,plats,cx,cy,title) or default
-            except: pass
+            try: return rt['get_display_char'](grid,plats,cx,cy,fps_title) or default
+            except:
+                debug_log("get_display_char failed:\n" + traceback.format_exc())
         return ed.get('display_char') or rt.get('display_char') or default
     return default
 
@@ -554,7 +600,6 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
         if 0 <= my < gh:
             row = grid[my]; sl = min(sx+w, len(row))
             if sx < sl:
-                # resolve_char can be a bit heavy; keep inline list comprehension but avoid excessive calls
                 ln = "".join([str(resolve_char(grid,plats,x,my,ltitle,row[x])) for x in range(sx,sl)])
                 try: stdscr.addstr(scr_y, max(0, ox), ln)
                 except: pass
@@ -574,7 +619,7 @@ def draw_scene(stdscr, grid, plats, px, py, cx, cy, fps, msg, time_val, lnum, lt
         except: pass
     try:
         t_str = "SPEEDRUN" if SPEEDRUN_MODE else f"LEVEL {lnum}"
-        if not msg: stdscr.addstr(0,0,f'{t_str} "{ltitle}"', curses.A_BOLD)
+        if not msg: stdscr.addstr(0,0,f'{t_str} \"{ltitle}\"', curses.A_BOLD)
         else: stdscr.addstr(0,1,msg, curses.A_REVERSE | curses.A_BOLD)
         t_txt = f"TIME: {time_val:.2f}s"; stdscr.addstr(0, max(0, w-len(t_txt)-1), t_txt, curses.A_BOLD)
     except: pass
@@ -592,7 +637,7 @@ def draw_centered_menu(stdscr,title,opts,sel):
         stdscr.addstr(by+box_h-1, bx+2, "UP/DOWN: Navigate  ENTER: Select  M: Close", curses.A_DIM); stdscr.refresh()
     except: pass
 
-# --- MENU FUNCTIONS (DO NTO MESS WITH THESE IT WILL KILL YOU) ---
+# --- MENU FUNCTIONS ---
 def show_in_game_menu(stdscr, allow_save=True):
     stdscr.nodelay(False)
     opts=["Resume"]
@@ -628,7 +673,7 @@ def arcade_name_entry(stdscr, total_time):
         if k in (curses.KEY_BACKSPACE,127,8): name=name[:-1]
         elif 32<=k<=126 and len(name)<10: name += chr(k).upper()
 
-# --- main play loop (menu-mode control moved here so menu funcs unchanged) ---
+# --- main play loop ---
 def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=None, allow_save=True):
     global SAVE_SLOT_PATH
     p_timers=[]; plugin_data={}
@@ -644,7 +689,9 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
     if resume_state:
         try:
             saved_f=resume_state.get("level_file","")
-            if saved_f and (os.path.basename(saved_f)==os.path.basename(level_file)):
+            saved_title = resume_state.get("level_title", "")
+            # Allow resume only if title matches
+            if saved_title and (str(saved_title) == str(title)):
                 r_px,r_py=float(resume_state.get("px",-1)),float(resume_state.get("py",-1))
                 if r_px>0 and r_py>0:
                     px,py=r_px,r_py; vx=float(resume_state.get("vx",0.0)); vy=float(resume_state.get("vy",0.0))
@@ -679,7 +726,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 inp.clear(); last=time.time()
             elif choice == "SAVE_ONLY":
                 if SAVE_SLOT_PATH:
-                    save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
+                    save={"level_file":os.path.abspath(level_file),"level_title": title,"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
                           "tot_time":t_offset+cur_t,"platform_timers":[p.t for p in plats],"plugin_state":plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save); msg="SAVED"; mend=time.time()+1.5
                 else: msg="NO SLOT"; mend=time.time()+1.5
@@ -690,7 +737,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 inp.clear(); last=time.time()
             elif choice == "SAVE_QUIT":
                 if SAVE_SLOT_PATH:
-                    save={"level_file":os.path.abspath(level_file),"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
+                    save={"level_file":os.path.abspath(level_file),"level_title": title,"level_num":level_num,"px":px,"py":py,"vx":vx,"vy":vy,"cp":cp,
                           "tot_time":t_offset+cur_t,"platform_timers":[p.t for p in plats],"plugin_state":plugin_data}
                     save_game_state_to(SAVE_SLOT_PATH, save)
                 return "QUIT", 0.0
@@ -705,10 +752,10 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
             for m in PLUGINS:
                 if callable(f:=m.get('runtime',{}).get('on_player_death')):
                     try: f(make_game_state(), plugin_data)
-                    except: pass
+                    except: debug_log("plugin on_player_death failed:\n" + traceback.format_exc())
 
         # simplified ground check & input direction (use inset collision wrapper)
-        ground = rect_collides(grid, px-PHYS['HW'], py+PHYS['HH'], px+PHYS['HW'], py+PHYS['HH']+0.05)
+        ground = rect_collides(grid, px-PHYS['HW'], py+PHYS['HH'], px+PHYS['HW'], py+PHYS['HH']+0.05, level_name=title)
         idir = (inp.down('RIGHT') - inp.down('LEFT'))
 
         # --- PLATFORM ATTACH MODE (ap) ---
@@ -721,7 +768,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                     step=min(rem,MAX_SUBSTEP); rem-=step
                     nxt = cur + (idir*MOVE_SPEED)*step
                     wx,wy = ap.x + nxt, ap.y - PHYS['HH'] - PHYS['TOL']
-                    if rect_collides(grid, wx-PHYS['HW'], wy-PHYS['HH']+0.1, wx+PHYS['HW'], wy+PHYS['HH']-0.1): break
+                    if rect_collides(grid, wx-PHYS['HW'], wy-PHYS['HH']+0.1, wx+PHYS['HW'], wy+PHYS['HH']-0.1, level_name=title): break
                     cur = nxt
                 ap_off = cur; px = ap.x + cur; py = ap.y - PHYS['HH'] - PHYS['TOL']; vy = 0
                 if ap_off + PHYS['HW'] <= 0 or ap_off - PHYS['HW'] >= ap.w: ap=None
@@ -735,7 +782,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                                 pstate={"px":px,"py":py,"vx":vx,"vy":vy}
                                 f({"dt":dt,"grid":grid,"level":title,"meta":meta}, pstate, lx, sy, plugin_data)
                                 vx=float(pstate.get("vx",vx)); vy=float(pstate.get("vy",vy))
-                            except: pass
+                            except: debug_log("plugin on_player_supported failed:\n" + traceback.format_exc())
 
         # --- NORMAL PHYSICS MODE ---
         else:
@@ -752,7 +799,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 # horizontal attempt (axis-separated)
                 if vx != 0.0:
                     npx = px + vx * step
-                    if rect_collides(grid, npx - PHYS['HW'], py - PHYS['HH'] + 0.01, npx + PHYS['HW'], py + PHYS['HH'] - 0.01):
+                    if rect_collides(grid, npx - PHYS['HW'], py - PHYS['HH'] + 0.01, npx + PHYS['HW'], py + PHYS['HH'] - 0.01, level_name=title):
                         # blocked horizontally — zero horizontal velocity for this axis
                         vx = 0.0
                     elif check_plat(plats, npx-PHYS['HW'], py-PHYS['HH']+0.1, npx+PHYS['HW'], py+PHYS['HH']-0.1):
@@ -762,7 +809,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 
                 # vertical attempt
                 npy = py + vy * step
-                if rect_collides(grid, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH']):
+                if rect_collides(grid, px - PHYS['HW'], npy - PHYS['HH'], px + PHYS['HW'], npy + PHYS['HH'], level_name=title):
                     # vertical collision handling
                     if vy > 0:
                         # hit a ceiling from below while moving downward (vy>0 means falling in this coordinate system)
@@ -778,7 +825,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                                         pstate={"px":px,"py":py,"vx":vx,"vy":vy}
                                         f({"dt":step,"grid":grid,"level":title,"meta":meta}, pstate, lx, ly, plugin_data)
                                         vx=float(pstate.get("vx",vx)); vy=float(pstate.get("vy",vy))
-                                    except: pass
+                                    except: debug_log("plugin support failed (ceiling):\n" + traceback.format_exc())
                     elif vy < 0:
                         # hitting something above while moving upward (vy<0)
                         py = math.floor(npy - PHYS['HH']) + PHYS['HH'] + 1.001
@@ -797,9 +844,8 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
 
         # --- POST-PHYSICS: collision triggers, plugins, death, cp, etc. ---
         icx,icy = int(px), int(py)
-        # more robust crush detection using rect_collides
         crush = rect_collides(grid, px - PHYS['HW'] + EPS_COLLIDE, py - PHYS['HH'] + EPS_COLLIDE,
-                              px + PHYS['HW'] - EPS_COLLIDE, py + PHYS['HH'] - EPS_COLLIDE)
+                              px + PHYS['HW'] - EPS_COLLIDE, py + PHYS['HH'] - EPS_COLLIDE, level_name=title)
         dist_to_cp = math.hypot(px-cp[0], py-cp[1]); is_safe=(dist_to_cp<1.0)
         tile = grid[icy][icx] if (0<=icy<len(grid) and 0<=icx<len(grid[0])) else ' '
         if tile==TILES['GOAL']: return "NEXT_LEVEL", cur_t
@@ -813,12 +859,12 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
                 if isinstance(ret, dict):
                     if "vx" in ret: vx=float(ret["vx"])
                     if "vy" in ret: vy=float(ret["vy"])
-            except: pass
+            except: debug_log("plugin on_player_touch failed:\n" + traceback.format_exc())
 
         tp=get_plugin(tile); deadly = bool(tp['runtime'].get('deadly',False)) if tp and 'runtime' in tp else False
         if tp and 'runtime' in tp and callable(f:=tp['runtime'].get('on_player_collide')):
             try: f({"grid":grid,"platforms":plats,"player":{"px":px,"py":py,"vx":vx,"vy":vy},"level":title,"meta":meta},{"px":px,"py":py,"vx":vx,"vy":vy}, icx, icy, plugin_data)
-            except: pass
+            except: debug_log("plugin on_player_collide failed:\n" + traceback.format_exc())
 
         should_die, reason = False, ""
         if crush and not is_safe: should_die, reason = True, "CRUSH"
@@ -833,7 +879,7 @@ def play_level(stdscr, level_file, inp, level_num, t_offset=0.0, resume_state=No
             for m in PLUGINS:
                 if callable(f:=m.get('runtime',{}).get('on_player_death')):
                     try: f({"grid":grid,"level":title,"meta":meta}, plugin_data)
-                    except: pass
+                    except: debug_log("plugin on_player_death (death) failed:\n" + traceback.format_exc())
             px,py,vx,vy,ap = cp[0],cp[1]-0.1,0,0,None
         elif tile==TILES['CP']:
             if (icx+0.5, icy+0.5)!=cp: cp=(icx+0.5, icy+0.5); msg="CHECKPOINT"; mend=time.time()+1.5
@@ -906,4 +952,3 @@ def main(stdscr):
 
 if __name__ == "__main__":
     curses.wrapper(main)
-

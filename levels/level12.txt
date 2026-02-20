@@ -68,6 +68,41 @@
 █                              ███     █
 █▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲███▲▲▲▲▲█
 ████████████████████████████████████████
-
 __METADATA__
-{"title": "Only Down", "platforms": [{"x": 18, "y": 10, "w": 5, "lx": 30.0, "ly": 0, "spd": 2.0, "ease": "SINE"}, {"x": 16, "y": 62, "w": 3, "lx": 20.0, "ly": 0, "spd": 2.0, "ease": "SINE"}], "block_overrides": {}}
+{
+  "title": "Only Down",
+  "platforms": [
+    {
+      "x": 18,
+      "y": 10,
+      "w": 5,
+      "lx": 30.0,
+      "ly": 0,
+      "spd": 2.0,
+      "ease": "SINE"
+    },
+    {
+      "x": 16,
+      "y": 62,
+      "w": 3,
+      "lx": 20.0,
+      "ly": 0,
+      "spd": 2.0,
+      "ease": "SINE"
+    }
+  ],
+  "block_overrides": {
+    "13,39": {
+      "stand_time": 2.0
+    },
+    "13,45": {
+      "stand_time": 2.0
+    },
+    "23,42": {
+      "stand_time": 2.0
+    },
+    "23,36": {
+      "stand_time": 2.0
+    }
+  }
+}

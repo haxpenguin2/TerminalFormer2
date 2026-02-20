@@ -1,175 +1,253 @@
 # plugins/breakable.py
-import time
+import time, os, traceback
 
 CHAR = "B"
 DEFAULT_STAND = 1.0
 
 # --- Textures ---
-# ▓ = Solid / Healthy
-# ▒ = Cracked / Reforming
-# ░ = Broken / Ghost
 TEX_SOLID = "▓"
 TEX_MID   = "▒"
 TEX_BROKEN = "░"
 
-# Global state tracker to sync physics with rendering
+# Runtime transient state:
+# keyed by (normalized_level, x, y) -> {"accum":..., "removed":..., "last_touch":..., "last_frame":...}
 _STATE = {}
-_CURRENT_LEVEL = "<start>"
 
 def _now(): return time.time()
 
-def _get(level, x, y):
-    # Normalize keys
-    lvl = str(level) if level is not None else "<unknown>"
-    key = (lvl, int(x), int(y))
+def _normalize_level(level):
+    if level is None:
+        return "<unknown>"
+    s = str(level)
+    if s.startswith("<") and s.endswith(">"):
+        return s
+    try:
+        base = os.path.splitext(os.path.basename(s))[0]
+        return base if base != "" else s
+    except:
+        return s
 
-    now = _now()
-    if key not in _STATE:
-        _STATE[key] = {
+def _key(level, x, y):
+    return (_normalize_level(level), int(x), int(y))
+
+def _get_state(level, x, y):
+    k = _key(level, x, y)
+    if k not in _STATE:
+        _STATE[k] = {
             "accum": 0.0,
-            "stand_time": DEFAULT_STAND,
             "removed": False,
             "last_touch": 0.0,
-            "last_frame": now
+            "last_frame": _now()
         }
-    return _STATE[key]
+    return _STATE[k]
 
-# --- runtime ---
+def _clear_level_state(level):
+    nl = _normalize_level(level)
+    for k in list(_STATE.keys()):
+        if k[0] == nl:
+            del _STATE[k]
 
-def runtime_solid(grid, x, y):
+def _read_override_from_meta(game_state, x, y):
     """
-    Called by the physics engine.
-    Returns True if solid, False if air.
+    Returns stand_time override (float) if present in game_state.meta["block_overrides"] else None.
+    Editor and level saving use meta["block_overrides"] with keys "x,y" -> {"stand_time":N}
     """
-    ix, iy = int(x), int(y)
+    try:
+        if not game_state: return None
+        meta = game_state.get("meta", {}) if isinstance(game_state, dict) else {}
+        overrides = meta.get("block_overrides", {}) if isinstance(meta, dict) else {}
+        key = f"{int(x)},{int(y)}"
+        entry = overrides.get(key)
+        if isinstance(entry, dict):
+            val = entry.get("stand_time")
+            if val is None:
+                # backward-compatible: maybe editor used "hp" or "time"
+                for alt in ("hp", "time", "dur", "break_time"):
+                    if alt in entry:
+                        try: return float(entry[alt])
+                        except: pass
+            else:
+                try: return float(val)
+                except: pass
+    except Exception:
+        # be silent, but safe
+        try:
+            open(os.path.expanduser("~/.tf2_debug.log"), "a").write(time.strftime("%Y-%m-%d %H:%M:%S ") + "meta read error\n" + traceback.format_exc() + "\n")
+        except: pass
+    return None
 
-    # Safety bounds check
-    if not (0 <= iy < len(grid) and 0 <= ix < len(grid[0])):
+# --- runtime API (be flexible about signatures) ---
+
+def runtime_solid(*args, **kwargs):
+    """
+    Compatible with multiple call signatures:
+      runtime_solid(grid, x, y, level_name=None)
+    or
+      runtime_solid(game_state_dict, x, y)
+    Returns True if tile acts solid (not removed), False if it's gone.
+    """
+    # detect whether first arg is a game_state (dict with 'grid') or raw grid
+    try:
+        if isinstance(args[0], dict) and 'grid' in args[0]:
+            game_state = args[0]; x = args[1]; y = args[2]
+            level = game_state.get("level")
+            grid = game_state.get("grid", [])
+        else:
+            grid = args[0]; x = args[1]; y = args[2]
+            level = args[3] if len(args) > 3 else kwargs.get("level_name")
+    except Exception:
         return False
 
-    # If the grid doesn't have our char, it's not our business
+    ix, iy = int(x), int(y)
+    if not (0 <= iy < len(grid) and 0 <= ix < len(grid[0])):
+        return False
     if grid[iy][ix] != CHAR:
         return False
 
-    # Check our internal state
-    ent = _get(_CURRENT_LEVEL, ix, iy)
-
-    # IF REMOVED, NO COLLISION. PERIOD.
-    if ent["removed"]:
-        return False
-
-    return True
+    ent = _get_state(level, ix, iy)
+    return not bool(ent.get("removed", False))
 
 def on_reset(game_state):
-    global _CURRENT_LEVEL
-    level = game_state.get("level", "<level>")
-    _CURRENT_LEVEL = level
+    """
+    Called when level resets/starts. Clear runtime state for this level
+    and pre-seed stand_time from metadata if present (for nicer visuals).
+    """
+    level = game_state.get("level", "<level>") if isinstance(game_state, dict) else "<level>"
+    # clear existing runtime entries for this level
+    _clear_level_state(level)
 
-    # Reset all blocks to healthy on level start
-    for k, ent in list(_STATE.items()):
-        lvl, bx, by = k
-        if str(lvl) == str(level):
-            ent["removed"] = False
-            ent["accum"] = 0.0
-            ent["last_frame"] = _now()
+    # If metadata provides overrides, create state entries with no accum and default removed=False.
+    try:
+        meta = game_state.get("meta", {}) if isinstance(game_state, dict) else {}
+        overrides = meta.get("block_overrides", {}) if isinstance(meta, dict) else {}
+        for k, v in overrides.items():
+            try:
+                sx, sy = map(int, k.split(","))
+                # create a state entry so get_display_char can immediately show configured visuals
+                entry = _get_state(level, sx, sy)
+                # store the configured stand_time on the runtime entry for convenience (not authoritative)
+                if isinstance(v, dict) and "stand_time" in v:
+                    try: entry["stand_time"] = float(v["stand_time"])
+                    except: entry["stand_time"] = DEFAULT_STAND
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 def on_player_supported(game_state, player_state, tx, ty, ctx):
-    global _CURRENT_LEVEL
-    level = game_state.get("level", "<level>")
-    _CURRENT_LEVEL = level
+    """
+    game_state is a dict with keys: grid, platforms, level, meta
+    ctx is expected to include "dt" (float) but we accept missing.
+    Accumulate dt into per-tile 'accum' and check stand_time from metadata.
+    """
+    try:
+        grid = game_state.get("grid")
+        level = game_state.get("level")
+    except Exception:
+        return
 
-    grid = game_state.get("grid")
-    bx = int(tx); by = int(ty)
-
-    if by < 0 or by >= len(grid) or bx < 0 or bx >= len(grid[0]): return
+    bx, by = int(tx), int(ty)
+    if not (0 <= by < len(grid) and 0 <= bx < len(grid[0])): return
     if grid[by][bx] != CHAR: return
 
-    ent = _get(level, bx, by)
-
-    # If it's removed, the physics engine shouldn't have let us stand here.
-    # But if we somehow glitch onto it, we ignore it.
-    if ent["removed"]: return
+    ent = _get_state(level, bx, by)
+    if ent.get("removed", False): return
 
     dt = 0.016
     if isinstance(ctx, dict) and "dt" in ctx:
         try: dt = float(ctx["dt"])
-        except: pass
+        except: dt = 0.016
 
-    # --- DAMAGE LOGIC ---
-    ent["accum"] += dt
+    # read stand_time from metadata (authoritative configuration)
+    override_val = _read_override_from_meta(game_state, bx, by)
+    if override_val is None:
+        # fallback: maybe runtime stored a pre-seeded value (from on_reset)
+        limit = float(ent.get("stand_time", DEFAULT_STAND))
+    else:
+        limit = float(override_val)
+        # save it to runtime entry for faster subsequent reads/visuals
+        ent["stand_time"] = limit
+
+    ent["accum"] = ent.get("accum", 0.0) + dt
     ent["last_touch"] = _now()
 
-    limit = ent.get("stand_time", DEFAULT_STAND)
-    if ent["accum"] >= limit:
+    if ent["accum"] >= (limit if limit > 0 else DEFAULT_STAND):
         ent["removed"] = True
-        # We do NOT remove the char from grid[][], keeping the ID for regeneration.
+        # do NOT mutate grid here; engine expects removed -> runtime solidity false
 
 def get_display_char(grid, plats, x, y, level_name):
-    global _CURRENT_LEVEL
-    _CURRENT_LEVEL = level_name
-
+    """
+    Called by renderer. Signature: (grid, plats, x, y, level_name)
+    We use the runtime state for visuals. If metadata provided stand_time and we have no runtime
+    entry yet, visuals will fallback to defaults until on_player_supported/on_reset seeds state.
+    """
     ix, iy = int(x), int(y)
     if not (0 <= iy < len(grid) and 0 <= ix < len(grid[0])): return ' '
-
-    # Only render logic for our character
     if grid[iy][ix] != CHAR: return grid[iy][ix]
 
-    ent = _get(level_name, ix, iy)
-    limit = ent.get("stand_time", DEFAULT_STAND)
+    ent = _get_state(level_name, ix, iy)
+    limit = float(ent.get("stand_time", DEFAULT_STAND))
     now = _now()
-
-    # Time delta calculation
-    delta = now - ent["last_frame"]
+    delta = now - ent.get("last_frame", now)
     ent["last_frame"] = now
     if delta > 0.1: delta = 0.1
 
-    # --- REGENERATION LOGIC ---
-    time_since_touch = now - ent["last_touch"]
-
-    # Wait 2 seconds before healing starts
-    if time_since_touch > 2.0 and ent["accum"] > 0:
-        # Heal speed: 0.5x
+    # try to reduce accum slowly if not recently touched (visual regen)
+    if now - ent.get("last_touch", 0) > 2.0 and ent.get("accum", 0.0) > 0.0:
         ent["accum"] = max(0.0, ent["accum"] - (delta * 0.5))
-
-        # Only solidify if FULLY healed (accum == 0)
-        if ent["removed"] and ent["accum"] <= 0.0:
+        if ent.get("removed", False) and ent["accum"] <= 0.0:
             ent["removed"] = False
             ent["accum"] = 0.0
 
-    # --- VISUALS ---
-    # Calculate how damaged it is (0.0 = Healthy, 1.0 = Broken)
-    pct = max(0.0, min(1.0, ent["accum"] / limit))
+    pct = max(0.0, min(1.0, (ent.get("accum", 0.0) / (limit if limit > 0 else DEFAULT_STAND))))
 
-    if ent["removed"]:
-        # GHOST STATE (Regenerating)
-        # It visually transitions from Light (Empty) -> Mid (Reforming)
-        # But maintains "removed" status so you fall through.
-        if pct > 0.5:
-            return TEX_BROKEN  # ░ (Still very broken)
-        else:
-            return TEX_MID     # ▒ (Almost formed, but still ghost)
-
+    if ent.get("removed", False):
+        return TEX_BROKEN if pct > 0.5 else TEX_MID
     else:
-        # SOLID STATE (Standing)
-        if pct < 0.3:
-            return TEX_SOLID   # ▓ (Healthy)
-        else:
-            return TEX_MID     # ▒ (Cracking)
+        return TEX_SOLID if pct < 0.3 else TEX_MID
 
 # --- editor hooks ---
 
 def editor_on_context(editor, gx, gy, get_string_input):
-    level = editor.meta.get('title', editor.filename)
-    ent = _get(level, gx, gy)
-    curr = ent.get("stand_time", DEFAULT_STAND)
-    val = get_string_input("Break Time (s)", str(curr))
+    """
+    Write configuration to editor.meta['block_overrides'] as:
+      "x,y" : { "stand_time": <float> }
+    This persists into the level __METADATA__ when editor.save_level() is called.
+    """
     try:
-        ent["stand_time"] = float(val)
-        editor.msg = f"Timer set to {val}s"
-    except:
+        # ensure meta dict exists
+        if "block_overrides" not in editor.meta or not isinstance(editor.meta["block_overrides"], dict):
+            editor.meta["block_overrides"] = {}
+
+        key = f"{int(gx)},{int(gy)}"
+        curr = editor.meta["block_overrides"].get(key, {}).get("stand_time", DEFAULT_STAND)
+        val = get_string_input("Break Time (s)", str(curr))
+        # accept blank or cancel -> no change
+        if val is None or val == "":
+            editor.msg = "Canceled"
+            return
+
+        newt = float(val)
+        editor.meta["block_overrides"][key] = {"stand_time": newt}
+        editor.msg = f"Break time set to {newt:.2f}s"
+
+        # If runtime state exists in-memory (editor may be running in same process), update it for immediate visual feedback
+        try:
+            lvl = editor.meta.get("title", editor.filename)
+            nk = _key(lvl, gx, gy)
+            if nk in _STATE:
+                _STATE[nk]["stand_time"] = float(newt)
+        except Exception:
+            pass
+
+    except Exception:
         editor.msg = "Invalid value"
 
 def editor_on_paint(editor, x, y):
+    """
+    Return dict to allow editor to set metadata at paint time if desired.
+    Here we just return the char and color; the context menu is used for setting time.
+    """
     return {"char": CHAR, "color": "BLUE"}
 
 def register():
